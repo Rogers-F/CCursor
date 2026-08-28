@@ -37,6 +37,7 @@ export function emitRollingCheckpoint(params: {
 
     logger.info({
         conversationId: params.conversationId,
+        origin: 'rolling',
         round: params.round,
         nextBlobbedMessageIndex: params.nextBlobbedMessageIndex,
         rollingTokenDetails,
@@ -103,6 +104,7 @@ export function emitFinalCheckpoint(params: {
 
     logger.info({
         conversationId: params.conversationId,
+        origin: 'final',
         blocks: params.lastAssistantContent?.length ?? 0,
         types: params.lastAssistantContent?.map(b => b.type) ?? [],
         thinkingLen: assistantSummary.thinking?.length ?? 0,

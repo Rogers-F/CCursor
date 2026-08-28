@@ -70,15 +70,24 @@ export function computeContextUsagePercent(usedTokens: number, maxTokens: number
 const AUTOCOMPACT_BUFFER_TOKENS = 20_000
 const MAX_OUTPUT_RESERVE = 20_000
 
+/**
+ * 净增长门槛: 距上次"有效"压缩基线的净增长须达到该值才允许再次自动压缩。
+ *
+ * 压缩重置值只含对话消息 (chars/4), 而下一轮 provider usage 立刻把估算抬回
+ * "压缩后对话 + 脚手架" —— 若无此门槛, 任何一次大文件读取都会再次越线,
+ * 形成"读一个文件就压缩"的锯齿循环。逼近窗口上限的硬安全线可无视本门槛。
+ */
+export const AUTOCOMPACT_NET_GROWTH_MIN_TOKENS = 15_000
+
 export function getAutoCompactThreshold(maxTokens: number, maxOutputTokens = 8192): number {
     const outputReserve = Math.min(maxOutputTokens, MAX_OUTPUT_RESERVE)
     const effective = maxTokens - outputReserve
     return effective - AUTOCOMPACT_BUFFER_TOKENS
 }
 
-export function shouldTriggerCompaction(usedTokens: number, maxTokens: number, thresholdPercent?: number): boolean {
+export function shouldTriggerCompaction(usedTokens: number, maxTokens: number, thresholdPercent?: number, maxOutputTokens = 8192): boolean {
     if (thresholdPercent !== undefined) {
         return computeContextUsagePercent(usedTokens, maxTokens) >= thresholdPercent;
     }
-    return usedTokens >= getAutoCompactThreshold(maxTokens);
+    return usedTokens >= getAutoCompactThreshold(maxTokens, maxOutputTokens);
 }

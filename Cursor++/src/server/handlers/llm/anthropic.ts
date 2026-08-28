@@ -196,11 +196,15 @@ export class AnthropicProvider implements LLMProvider {
                 input: finalMessage.usage.input_tokens,
             }, '[ANTHROPIC] prompt cache');
         }
+        // Anthropic 的 input_tokens 不含 cache_read/cache_creation (三者互不相交)。
+        // 归一成"完整 prompt 规模"口径 (与 OpenAI prompt_tokens / Gemini promptTokenCount 一致),
+        // auto-compaction 的触发判定依赖该口径; 若只上报裸 input_tokens, 缓存命中轮会严重低估。
+        const fullPromptTokens = (finalMessage.usage.input_tokens ?? 0) + cacheRead + cacheWrite;
         yield {
             type: 'done',
             stopReason: finalMessage.stop_reason ?? 'end_turn',
             usage: {
-                inputTokens: finalMessage.usage.input_tokens,
+                inputTokens: fullPromptTokens,
                 outputTokens: finalMessage.usage.output_tokens,
                 cacheReadTokens: cacheRead || undefined,
                 cacheWriteTokens: cacheWrite || undefined,

@@ -67,6 +67,15 @@ export async function* handleSummarizeAction(
             missingHistoryBlobs,
         }, '[AGENT] summarizeAction skipped due to incomplete history');
 
+        logger.info({
+            conversationId: parsed.conversationId,
+            origin: 'client_summarize',
+            kind: 'committed',
+            usedTokens: currentTokenDetails.usedTokens,
+            maxTokens: currentTokenDetails.maxTokens,
+            rootBlobCount: parsed.historyBlobIds.length,
+            summaryArchiveCount: parsed.historySummaryArchiveIds.length,
+        }, '[AUTOCOMPACT] checkpoint write');
         persistConversationCheckpoint({
             kind: 'committed',
             conversationId: parsed.conversationId,
@@ -98,6 +107,15 @@ export async function* handleSummarizeAction(
     }
 
     if (compactionPlan.summarizeEntries.length === 0) {
+        logger.info({
+            conversationId: parsed.conversationId,
+            origin: 'client_summarize',
+            kind: 'committed',
+            usedTokens: currentTokenDetails.usedTokens,
+            maxTokens: currentTokenDetails.maxTokens,
+            rootBlobCount: parsed.historyBlobIds.length,
+            summaryArchiveCount: parsed.historySummaryArchiveIds.length,
+        }, '[AUTOCOMPACT] checkpoint write');
         persistConversationCheckpoint({
             kind: 'committed',
             conversationId: parsed.conversationId,
@@ -210,6 +228,15 @@ export async function* handleSummarizeAction(
         currentTokenDetails.maxTokens,
     );
 
+    logger.info({
+        conversationId: parsed.conversationId,
+        origin: 'client_summarize',
+        kind: 'committed',
+        usedTokens: compactedUsedTokens.usedTokens,
+        maxTokens: compactedUsedTokens.maxTokens,
+        rootBlobCount: artifacts.nextRootBlobIds.length,
+        summaryArchiveCount: artifacts.nextSummaryArchiveIds.length,
+    }, '[AUTOCOMPACT] checkpoint write');
     persistConversationCheckpoint({
         kind: 'committed',
         conversationId: parsed.conversationId,

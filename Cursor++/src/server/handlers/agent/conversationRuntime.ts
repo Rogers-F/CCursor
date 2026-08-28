@@ -22,7 +22,7 @@ import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
-import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
+import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
 import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
@@ -537,12 +537,21 @@ async function* performInlineAutoSummarize(params: {
     return null
   }
 
+  // keepTail 构成观测: 巨型 tool_result (大文件读取 / Task 报告) 是否钉在尾窗,
+  // 直接决定压缩后基线能否降到触发线以下
+  const keepTailEntries = compactionPlan.keepTail.map(entry => ({
+    role: entry.message.role,
+    toolName: entry.message.toolName,
+    tokens: estimateMessagesTokens([entry.message]),
+  }))
   logger.info({
     conversationId: parsed.conversationId,
     totalEntries: historyEntries.length,
     summarizeCount: compactionPlan.summarizeEntries.length,
     keepTailCount: compactionPlan.keepTail.length,
     leadingCount: compactionPlan.leading.length,
+    keepTailTokens: keepTailEntries,
+    maxKeepTailEntryTokens: keepTailEntries.reduce((m, e) => Math.max(m, e.tokens), 0),
     usedTokensEstimate,
     contextTokenLimit,
   }, '[AGENT] auto-summarize: starting inline compaction')
@@ -611,6 +620,15 @@ async function* performInlineAutoSummarize(params: {
     contextTokenLimit,
   )
 
+  logger.info({
+    conversationId: parsed.conversationId,
+    origin: 'inline',
+    kind: 'committed',
+    usedTokens: compactedTokenDetails.usedTokens,
+    maxTokens: compactedTokenDetails.maxTokens,
+    rootBlobCount: artifacts.nextRootBlobIds.length,
+    summaryArchiveCount: artifacts.nextSummaryArchiveIds.length,
+  }, '[AUTOCOMPACT] checkpoint write')
   persistConversationCheckpoint({ kind: 'committed',
     conversationId: parsed.conversationId,
     rootBlobIds: artifacts.nextRootBlobIds,
@@ -692,6 +710,17 @@ export async function* handleConversationRun(
     parsed.contextTokenLimit = route.contextTokenLimit
   }
   const contextTokenLimit = parsed.contextTokenLimit ?? route.contextTokenLimit
+  // contextTokenLimit<=0 (providers.json 未配置 context 且客户端未下发 parameters.context)
+  // 会使阈值变负 -> shouldTriggerCompaction 恒真 -> 每个工具轮都压缩。显式禁用并告警。
+  const autoCompactEnabled = contextTokenLimit > 0
+  if (!autoCompactEnabled) {
+    logger.warn({
+      conversationId: parsed.conversationId,
+      modelId: parsed.modelId,
+      routeContextTokenLimit: route.contextTokenLimit,
+      requestedContextTokenLimit,
+    }, '[AGENT] auto-compact disabled: non-positive contextTokenLimit — configure providers.json context or send parameters.context')
+  }
   logger.debug({
     conversationId: parsed.conversationId,
     modelId: parsed.modelId,
@@ -864,6 +893,8 @@ export async function* handleConversationRun(
   // 不再用 autoSummarizePerformed 一次性限制——每轮都可重复触发,直至连续失败 3 次停止
   let autoCompactConsecutiveFailures = 0
   const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+  // 上次"有效"压缩后的估算基线; 净增长门槛的参照点 (0 = 本 run 尚未压缩过)
+  let lastCompactionBaseline = 0
   const syntheticUserMessageId = parsed.isBackgroundTaskCompletion
     ? `background-completion-${Date.now()}`
     : parsed.rawUserMessage?.messageId && typeof parsed.rawUserMessage.messageId === 'string'
@@ -964,10 +995,26 @@ export async function* handleConversationRun(
   logger.info(`[AGENT] → [${route.provider.name}/${route.model}] "${userPreview}" (${messages.length} msgs)`)
 
   const usageTotals = emptyUsageTotals()
-  let usedTokensEstimate = Math.max(
-    parsed.historyTokenDetails?.usedTokens ?? 0,
-    estimateMessagesTokens(messages),
-  )
+  // 估算来源归因: 记录 usedTokensEstimate 当前由哪把尺子顶到该值
+  // ('client-inherited' = 客户端回传的 checkpoint 值 | 'chars/4' | 'provider')
+  let estimateSource: 'client-inherited' | 'chars/4' | 'provider' = 'chars/4'
+  const clientInheritedTokens = parsed.historyTokenDetails?.usedTokens ?? 0
+  const charsInitTokens = estimateMessagesTokens(messages)
+  if (clientInheritedTokens > 0 && clientInheritedTokens >= charsInitTokens)
+    estimateSource = 'client-inherited'
+  let usedTokensEstimate = Math.max(clientInheritedTokens, charsInitTokens)
+  logger.info({
+    conversationId: parsed.conversationId,
+    isSubagent: parsed.isSubagent,
+    historyTokenDetails: parsed.historyTokenDetails,
+    routeContextTokenLimit: route.contextTokenLimit,
+    contextTokenLimit,
+    clientInheritedTokens,
+    charsInitTokens,
+    initialEstimate: usedTokensEstimate,
+    estimateSource,
+    autoCompactEnabled,
+  }, '[AUTOCOMPACT] run start baseline')
   let lastAssistantContent: LLMContentBlock[] | undefined
   let stepCounter = 0
 
@@ -1145,15 +1192,37 @@ export async function* handleConversationRun(
             }
             break
           }
-          case 'done':
+          case 'done': {
             ({ currentThinking, currentText } = flushPendingAssistantPrefix({
               roundAssistantBlocks,
               currentThinking,
               currentText,
             }))
             Object.assign(usageTotals, addUsage(usageTotals, event.usage))
-            usedTokensEstimate = Math.max(usedTokensEstimate, estimateContextTokens(event.usage))
+            const estimateBefore = usedTokensEstimate
+            const providerEstimate = estimateContextTokens(event.usage)
+            if (providerEstimate > usedTokensEstimate)
+              estimateSource = 'provider'
+            usedTokensEstimate = Math.max(usedTokensEstimate, providerEstimate)
+            // 尺子差观测点: inputTokens(全量,含脚手架) 与 chars/4(仅对话消息) 的差
+            // 即"脚手架 + tokenizer 偏差"的实测值, 用于校准压缩重置的自校准补偿
+            const charsEstimate = estimateMessagesTokens(messages)
+            logger.info({
+              conversationId: parsed.conversationId,
+              round,
+              inputTokens: event.usage.inputTokens,
+              outputTokens: event.usage.outputTokens,
+              cacheReadTokens: event.usage.cacheReadTokens ?? 0,
+              cacheWriteTokens: event.usage.cacheWriteTokens ?? 0,
+              providerEstimate,
+              charsEstimate,
+              scaffoldDelta: Math.max(0, (event.usage.inputTokens ?? 0) - charsEstimate),
+              estimateBefore,
+              estimateAfter: usedTokensEstimate,
+              estimateSource,
+            }, '[AUTOCOMPACT] provider usage latch')
             break
+          }
         }
       }, undefined, (event) => {
         if (event.type === 'tool_use_start')
@@ -1346,7 +1415,10 @@ export async function* handleConversationRun(
         blobIds,
       ))
 
-      usedTokensEstimate = Math.max(usedTokensEstimate, estimateMessagesTokens(messages))
+      const charsLatch = estimateMessagesTokens(messages)
+      if (charsLatch > usedTokensEstimate)
+        estimateSource = 'chars/4'
+      usedTokensEstimate = Math.max(usedTokensEstimate, charsLatch)
 
       const allBlobIdsForCheckpoint = [...parsed.historyBlobIds, ...blobIds]
       const materializedTurnBlob = activeTurn?.materializeTurnBlob()
@@ -1374,14 +1446,39 @@ export async function* handleConversationRun(
       // 链路①: 服务端 Agent Run 内自动 summarize
       // 每轮都检查——超阈值就触发 compaction,可重复触发,连续失败 3 次才熔断
       // (对齐 Claude Code autoCompactIfNeeded 的 consecutiveFailures 熔断机制)
-      if (autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
-        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit)) {
+      //
+      // 两道防抖 (诊断报告 §8.1):
+      //   1. 净增长门槛: 距上次有效压缩基线的净增长 >= 15K 才允许再次触发,
+      //      打断"压缩后 provider usage 立刻反弹 -> 读一个文件就再压"的锯齿循环;
+      //   2. 硬安全线: 距窗口上限不足 8K 时无视门槛立即压缩,不为等门槛撑爆窗口。
+      // 阈值传入 route 真实 maxOutputTokens, 恢复注释宣称的 40K 余量 (此前恒为默认 8192, 仅 28K)。
+      const autoCompactThreshold = getAutoCompactThreshold(contextTokenLimit, route.maxOutputTokens)
+      const overThreshold = autoCompactEnabled
+        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit, undefined, route.maxOutputTokens)
+      const netGrowthSinceCompaction = usedTokensEstimate - lastCompactionBaseline
+      const netGrowthOk = netGrowthSinceCompaction >= AUTOCOMPACT_NET_GROWTH_MIN_TOKENS
+      const hardPressure = usedTokensEstimate >= contextTokenLimit - Math.min(contextTokenLimit, 8192)
+      if (overThreshold && !netGrowthOk && !hardPressure) {
+        logger.info({
+          conversationId: parsed.conversationId,
+          round,
+          usedTokensEstimate,
+          threshold: autoCompactThreshold,
+          lastCompactionBaseline,
+          netGrowthSinceCompaction,
+          netGrowthMin: AUTOCOMPACT_NET_GROWTH_MIN_TOKENS,
+          estimateSource,
+        }, '[AGENT] auto-summarize: net-growth gate holds, skipping compaction')
+      } else if (overThreshold && autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
         logger.info({
           conversationId: parsed.conversationId,
           round,
           usedTokensEstimate,
           contextTokenLimit,
-          threshold: getAutoCompactThreshold(contextTokenLimit),
+          threshold: autoCompactThreshold,
+          maxOutputTokens: route.maxOutputTokens,
+          estimateSource,
+          hardPressure,
           consecutiveFailures: autoCompactConsecutiveFailures,
         }, '[AGENT] auto-summarize: threshold exceeded, triggering inline compaction')
 
@@ -1406,12 +1503,30 @@ export async function* handleConversationRun(
           blobIds = []
           blobCounter = 0
           nextBlobbedMessageIndex = messages.length
-          autoCompactConsecutiveFailures = 0 // 成功后重置
+
+          // 压缩后仍超线 = 无效压缩 (keepTail 巨物压不动), 计入熔断而非清零,
+          // 否则"每轮都成功压缩却永远降不到线下"的循环没有任何刹车
+          if (usedTokensEstimate >= autoCompactThreshold) {
+            autoCompactConsecutiveFailures++
+            lastCompactionBaseline = usedTokensEstimate
+            logger.warn({
+              conversationId: parsed.conversationId,
+              newUsedTokens: usedTokensEstimate,
+              threshold: autoCompactThreshold,
+              consecutiveFailures: autoCompactConsecutiveFailures,
+            }, '[AGENT] auto-summarize: compaction ineffective (still above threshold), counting toward fuse')
+          } else {
+            autoCompactConsecutiveFailures = 0 // 有效压缩,成功后重置
+            lastCompactionBaseline = usedTokensEstimate
+          }
 
           logger.info({
             conversationId: parsed.conversationId,
             newMessageCount: messages.length,
             newUsedTokens: usedTokensEstimate,
+            threshold: autoCompactThreshold,
+            gapToThreshold: autoCompactThreshold - usedTokensEstimate,
+            lastCompactionBaseline,
           }, '[AGENT] auto-summarize: state replaced, continuing agent loop')
         } else {
           autoCompactConsecutiveFailures++
@@ -1454,7 +1569,10 @@ export async function* handleConversationRun(
     blobIds,
   ))
 
-  usedTokensEstimate = Math.max(usedTokensEstimate, estimateMessagesTokens(messages))
+  const finalCharsLatch = estimateMessagesTokens(messages)
+  if (finalCharsLatch > usedTokensEstimate)
+    estimateSource = 'chars/4'
+  usedTokensEstimate = Math.max(usedTokensEstimate, finalCharsLatch)
 
   const finalTurnBlob = activeTurn?.materializeTurnBlob()
   if (finalTurnBlob)

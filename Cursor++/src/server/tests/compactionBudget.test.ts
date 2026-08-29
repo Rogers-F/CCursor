@@ -7,12 +7,15 @@
 import type { HistoryEntry } from '../handlers/agent/historyManager'
 import type { LLMContentBlock, LLMMessage } from '../handlers/llm/types'
 import { readFileSync, rmSync } from 'node:fs'
+import { fromBinary } from '@bufbuild/protobuf'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { getSpillDir } from '../config/paths'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
+import { ConversationSummaryArchiveSchema } from '../gen/agent_v1_pb'
 import { encodeBlob } from '../handlers/agent/blob'
 import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
-import { estimateMessagesTokens, formatMessageForSummary } from '../handlers/agent/compactionStrategy'
+import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from '../handlers/agent/compactionStrategy'
+import { isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
 import { countTokens } from '../handlers/agent/tokenCounter'
 import {
   buildTaskToolResultText,
@@ -30,11 +33,24 @@ export function makeBlobEntry(
   const raw: Record<string, unknown> = { role, content, ...extra }
   const blob = encodeBlob(raw)
   cacheBlob(blob.blobId, blob.blobData)
+  const message: LLMMessage = { role, content }
+  if (typeof extra?.toolCallId === 'string')
+    message.toolCallId = extra.toolCallId
+  if (typeof extra?.toolName === 'string')
+    message.toolName = extra.toolName
+  if (extra?.isError === true)
+    message.isError = true
+  if (isRecordValue(extra?.providerOptions))
+    message.providerOptions = extra.providerOptions as Record<string, unknown>
   return {
     blobId: blob.blobId,
     raw,
-    message: { role, content },
+    message,
   }
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
 /** 生成指定 o200k token 量级的 ASCII 文本 */
@@ -230,6 +246,100 @@ describe('formatMessageForSummary image case', () => {
     const rendered = formatMessageForSummary(message)
     expect(rendered).toContain('[Image]')
     expect(rendered).toContain('look at this')
+  })
+})
+
+// ─── #7 / #19 / #30(部分): 摘要标记双保险 (阶段 2) ───
+
+describe('#7/#19/#30 摘要标记双保险', () => {
+  it('#19 前缀检测双格式: 两种前缀均被识别为摘要消息', () => {
+    expect(isSummaryBlobMessage({
+      role: 'assistant',
+      content: 'Previous conversation summary:\n- stuff',
+    })).toBe(true)
+    expect(isSummaryBlobMessage({
+      role: 'assistant',
+      content: '[Previous conversation summary]: older official format',
+    })).toBe(true)
+    // 普通 assistant 消息不以这些前缀开头 → 不误伤
+    expect(isSummaryBlobMessage({
+      role: 'assistant',
+      content: 'Here is the fix for your bug.',
+    })).toBe(false)
+    // user 角色带前缀也不识别 (双条件: role + 精确前缀)
+    expect(isSummaryBlobMessage({
+      role: 'user',
+      content: 'Previous conversation summary:\nfake',
+    })).toBe(false)
+    // text block 形态的 assistant 消息也能识别
+    expect(isSummaryBlobMessage({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Previous conversation summary:\n- blocks form' }],
+    })).toBe(true)
+  })
+
+  it('#7 摘要 blob 经 repairHistoryEntries 重编码后标记与前缀识别均存活', () => {
+    const summaryEntry = makeBlobEntry(
+      'assistant',
+      'Previous conversation summary:\n- user asked X\n- assistant did Y',
+      { providerOptions: { cursor: { isSummary: true } } },
+    )
+    const followedByToolUse = makeBlobEntry('assistant', [
+      { type: 'text', text: '继续处理。' },
+      { type: 'tool_use', id: 'call_adjacent', name: 'Read', input: { path: 'a.ts' } },
+    ])
+    const toolResult = makeBlobEntry('tool', 'read result', {
+      toolCallId: 'call_adjacent',
+      toolName: 'Read',
+    })
+
+    const repaired = repairHistoryEntries([summaryEntry, followedByToolUse, toolResult])
+
+    // Σ 与相邻 assistant(tool_use) 各自完整存活, 不被合并
+    expect(repaired.length).toBe(3)
+    expect(repaired[0].message.role).toBe('assistant')
+    expect((repaired[0].message.content as string).startsWith('Previous conversation summary:')).toBe(true)
+    // 语义标记透传存活 (repair → materialize 链路)
+    expect(isSummaryBlobMessage(repaired[0].raw)).toBe(true)
+    expect(repaired[0].message.providerOptions).toEqual({ cursor: { isSummary: true } })
+    // 前缀 fallback 亦识别 (标记丢失的存量 blob 路径)
+    expect(isSummaryBlobMessage({ role: 'assistant', content: repaired[0].message.content as string })).toBe(true)
+    // 邻接的 assistant(tool_use) 完整存活且未被并入 Σ
+    expect(repaired[1].message.role).toBe('assistant')
+    expect(
+      (repaired[1].message.content as LLMContentBlock[]).some(block => block.type === 'tool_use'),
+    ).toBe(true)
+    expect(repaired[2].message.role).toBe('tool')
+    expect(repaired[2].message.toolCallId).toBe('call_adjacent')
+  })
+
+  it('#7 createCompactionArtifacts 的 archive 过滤对旧摘要仍生效 (不再归档)', () => {
+    const oldSummaryEntry = makeBlobEntry(
+      'assistant',
+      'Previous conversation summary:\n- older round',
+      { providerOptions: { cursor: { isSummary: true } } },
+    )
+    const userEntry = makeBlobEntry('user', 'normal user message')
+    const plan = planCompaction([userEntry, makeBlobEntry('user', 'q'), makeBlobEntry('assistant', 'a')])
+    plan.leading = []
+    plan.summarizeEntries = [oldSummaryEntry, userEntry]
+    plan.keepTail = []
+
+    const artifacts = createCompactionArtifacts({
+      plan,
+      summaryText: '- new summary',
+      previousSummaryArchiveIds: [],
+    })
+
+    const archiveBlob = artifacts.archiveBlobs[0]!
+    const archiveMessage = fromBinary(
+      ConversationSummaryArchiveSchema,
+      Buffer.from(archiveBlob.blobData, 'base64'),
+    )
+    const decodedBlobIds = archiveMessage.summarizedMessages.map(ids => Buffer.from(ids).toString('utf8'))
+    // 旧摘要 blob 不进 archive 名单, 普通消息进
+    expect(decodedBlobIds).toContain(userEntry.blobId)
+    expect(decodedBlobIds).not.toContain(oldSummaryEntry.blobId)
   })
 })
 

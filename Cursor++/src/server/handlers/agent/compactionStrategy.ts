@@ -713,7 +713,9 @@ export function planCompaction(entries: HistoryEntry[], options?: PlanCompaction
         }, '[AUTOCOMPACT] small window infeasible for budget mode — degrading to B-mode (full summarization + single anchor)');
         return {
             leading,
-            summarizeEntries: lastRealUserEntry ? body.filter(entry => entry !== lastRealUserEntry) : body,
+            // 双保险 (§3.5): 锚点既留在摘要源 (摘要器对齐任务) 又原文保留于尾窗;
+            // archive 不重复归档由 createCompactionArtifacts 的 anchorBlobId 排除保证
+            summarizeEntries: body,
             keepTail: bModeKeepTail,
             elidedOriginals: [],
             mode: 'b-mode',
@@ -900,7 +902,8 @@ export function planCompaction(entries: HistoryEntry[], options?: PlanCompaction
         logger.warn({ contextTokenLimit }, '[AUTOCOMPACT] floor violation persisted through escalation chain — degrading to B-mode');
         return {
             leading,
-            summarizeEntries: bModeAnchor ? body.filter(entry => entry !== bModeAnchor) : body,
+            // 双保险 (§3.5): 锚点不从摘要侧移除; archive 排除由 anchorBlobId 保证
+            summarizeEntries: body,
             keepTail: bModeAnchor ? [bModeAnchor] : [],
             elidedOriginals: [],
             mode: 'b-mode',

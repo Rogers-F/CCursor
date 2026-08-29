@@ -1,3 +1,4 @@
+import type { CompactionPlan } from '../handlers/agent/compactionStrategy'
 /**
  * compactionBudget.test.ts — 第二阶段自动压缩修复 (keepTail 预算化) 测试
  *
@@ -14,8 +15,9 @@ import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { ConversationSummaryArchiveSchema } from '../gen/agent_v1_pb'
 import { encodeBlob } from '../handlers/agent/blob'
 import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from '../handlers/agent/compactionStrategy'
-import { isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
+import { getCompactionContentionCount, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from '../handlers/agent/compactionLock'
+import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, measureMessagesTokens, planCompaction } from '../handlers/agent/compactionStrategy'
+import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
 import { countTokens } from '../handlers/agent/tokenCounter'
 import {
   buildTaskToolResultText,
@@ -77,11 +79,16 @@ export function makeVariedReportText(chars: number): string {
   return lines.join('\n')
 }
 
-/** 生成指定 o200k token 量级的中文文本 (chars/4 低估 4x 场景) */
+/** 生成指定 o200k token 量级的中文文本 (chars/4 低估 4x 场景; 比例收敛校准) */
 export function makeTokenSizedChineseText(tokens: number): string {
-  let text = '汉字内容片段'.repeat(Math.ceil(tokens / 3))
-  while (countTokens(text) > tokens) {
-    text = text.slice(0, Math.max(0, text.length - 2))
+  let text = '汉字内容片段。'.repeat(Math.ceil(tokens / 2))
+  let guard = 0
+  while (guard < 200) {
+    const current = countTokens(text)
+    if (current <= tokens)
+      break
+    text = text.slice(0, Math.max(24, Math.floor(text.length * tokens / current)))
+    guard += 1
   }
   return text
 }
@@ -343,7 +350,691 @@ describe('#7/#19/#30 摘要标记双保险', () => {
   })
 })
 
-// ─── 占位符: 后续阶段测试占位, 保证文件始终可运行 ───
+// ─── 阶段 3: 预算化核心 (§4 算法) ───
+
+/** 生成指定 o200k token 量级的多样化文本 (无同字符长游程; 比例构造 + 指数收敛校准) */
+export function makeVariedTokenText(tokens: number): string {
+  const words = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta', 'iota', 'kappa', 'lambda', 'mu']
+  // 实测校准: 每词 (含空格) ≈ 1.25 token
+  const wordCount = Math.max(4, Math.ceil((tokens * 1.03) / 1.25))
+  const parts: string[] = []
+  for (let index = 0; index < wordCount; index++)
+    parts.push(words[index % words.length])
+  let text = parts.join(' ')
+  // 指数收敛: 每次裁 2% 直到达标 (~20 次编码内收敛)
+  let guard = 0
+  while (countTokens(text) > tokens && text.length > 24 && guard < 200) {
+    text = text.slice(0, Math.floor(text.length * 0.98))
+    guard += 1
+  }
+  return text
+}
+
+function makeLeadingEntries(): HistoryEntry[] {
+  return [
+    makeBlobEntry('system', 'You are a helpful assistant.'),
+    makeBlobEntry('user', '<user_info>\nUser context here\n</user_info>'),
+  ]
+}
+
+interface ToolGroupSpec {
+  callId: string
+  toolName: string
+  input: Record<string, unknown>
+  resultTokens: number
+  resultText?: string
+}
+
+/** 构造 [assistant(tool_use) + tool(result)] 原子组 */
+function makeToolGroup(spec: ToolGroupSpec): HistoryEntry[] {
+  const resultText = spec.resultText ?? makeVariedTokenText(spec.resultTokens)
+  return [
+    makeBlobEntry('assistant', [
+      { type: 'text', text: `calling ${spec.toolName}` },
+      { type: 'tool_use', id: spec.callId, name: spec.toolName, input: spec.input },
+    ]),
+    makeBlobEntry('tool', resultText, { toolCallId: spec.callId, toolName: spec.toolName }),
+  ]
+}
+
+/** 前置普通历史 (确保摘要侧非空 — 占位把尾窗压小后整体可能装入预算导致 no-op) */
+function pushBulkHistory(entries: HistoryEntry[], count: number, tokensPerEntry: number): void {
+  for (let index = 0; index < count; index++)
+    entries.push(makeBlobEntry(index % 2 === 0 ? 'user' : 'assistant', makeVariedTokenText(tokensPerEntry)))
+}
+
+function collectToolUseIdsFromEntries(entries: HistoryEntry[]): Set<string> {
+  const ids = new Set<string>()
+  for (const entry of entries) {
+    if (!Array.isArray(entry.message.content))
+      continue
+    for (const block of entry.message.content) {
+      if (block.type === 'tool_use')
+        ids.add(block.id)
+    }
+  }
+  return ids
+}
+
+function collectToolResultIdsFromEntries(entries: HistoryEntry[]): Set<string> {
+  const ids = new Set<string>()
+  for (const entry of entries) {
+    if (entry.message.role === 'tool') {
+      if (entry.message.toolCallId)
+        ids.add(entry.message.toolCallId)
+      continue
+    }
+    if (!Array.isArray(entry.message.content))
+      continue
+    for (const block of entry.message.content) {
+      if (block.type === 'tool_result')
+        ids.add(block.toolUseId)
+    }
+  }
+  return ids
+}
+
+function expectNoSplitToolPairsInPlan(plan: CompactionPlan): void {
+  const tailResultIds = collectToolResultIdsFromEntries(plan.keepTail)
+  const summarizeUseIds = collectToolUseIdsFromEntries(plan.summarizeEntries)
+  const summarizeResultIds = collectToolResultIdsFromEntries(plan.summarizeEntries)
+  for (const resultId of tailResultIds)
+    expect(summarizeUseIds.has(resultId), `result ${resultId} split from its use`).toBe(false)
+  for (const useId of summarizeUseIds)
+    expect(tailResultIds.has(useId) && !summarizeResultIds.has(useId), `use ${useId} split from its result`).toBe(false)
+}
+
+describe('#1 生产回归: 巨物尾窗序列', () => {
+  it('#1 40K+40K+20K+10K+2K+1K 尾窗: 压缩后消息侧 ≤ 80K, 三条巨物被占位, 配对完整', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(1_000)),
+    ]
+    // 前置历史: 10 条 5K 消息 (模拟 70+ 轮日志中的中段)
+    for (let index = 0; index < 10; index++)
+      entries.push(makeBlobEntry(index % 2 === 0 ? 'user' : 'assistant', makeVariedTokenText(5_000)))
+    // 生产尾窗: 40K/40K/20K/10K/2K/1K
+    const tailSizes = [40_000, 40_000, 20_000, 10_000, 2_000, 1_000]
+    tailSizes.forEach((resultTokens, index) => {
+      entries.push(...makeToolGroup({
+        callId: `call_prod_${index}`,
+        toolName: 'Read',
+        input: { path: `/repo/src/file-${index}.ts` },
+        resultTokens,
+      }))
+    })
+
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    expect(plan.mode).toBe('budget')
+    expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+
+    // 三条巨物 (40K/40K/20K > 巨物线 ~11K) 被占位, 10K/2K/1K 保原文
+    expect(plan.diagnostics.placeholderCount).toBe(3)
+    // keepTail 实占受预算约束 (leading 极小 → budget ≈ 59.5K ≤ 60K 上限)
+    expect(plan.diagnostics.keepTailActualTokens).toBeLessThanOrEqual(plan.diagnostics.budgetTokens + 2_000)
+    // 压缩后消息侧 = leading + Σ(按预留估计) + keepTail ≤ 80K
+    const messageSideEstimate = plan.diagnostics.leadingTokens + plan.diagnostics.summaryReserveTokens + plan.diagnostics.keepTailActualTokens
+    expect(messageSideEstimate).toBeLessThanOrEqual(80_000)
+    // 占位符保留骨架: role/toolCallId/toolName
+    const placeholderEntries = plan.keepTail.filter(entry =>
+      typeof entry.message.content === 'string' && entry.message.content.includes('[tool output elided'))
+    expect(placeholderEntries.length).toBe(3)
+    for (const placeholderEntry of placeholderEntries) {
+      expect(placeholderEntry.message.role).toBe('tool')
+      expect(placeholderEntry.message.toolCallId).toMatch(/^call_prod_/)
+      expect(placeholderEntry.message.toolName).toBe('Read')
+    }
+    // 配对完整
+    expectNoSplitToolPairsInPlan(plan)
+  })
+})
+
+describe('#2/#26 安全点与孤儿断言', () => {
+  it('#2 工具链在头/中/尾 × OpenAI/Anthropic 双形态: 两侧均无孤立配对', () => {
+    const openAiForm: HistoryEntry[] = [
+      ...makeToolGroup({ callId: 'call_head', toolName: 'Read', input: { path: 'h.ts' }, resultTokens: 50 }),
+      makeBlobEntry('user', makeVariedTokenText(6_000)),
+      makeBlobEntry('assistant', makeVariedTokenText(6_000)),
+      ...makeToolGroup({ callId: 'call_mid', toolName: 'Shell', input: { command: 'ls' }, resultTokens: 6_000 }),
+      makeBlobEntry('user', makeVariedTokenText(6_000)),
+      ...makeToolGroup({ callId: 'call_tail', toolName: 'Read', input: { path: 't.ts' }, resultTokens: 50 }),
+    ]
+    // Anthropic 形态: tool_result 为 user 消息 content block
+    const anthropicForm: HistoryEntry[] = [
+      makeBlobEntry('assistant', [{ type: 'tool_use', id: 'call_a1', name: 'Read', input: { path: 'a.ts' } }]),
+      makeBlobEntry('user', [{ type: 'tool_result', toolUseId: 'call_a1', toolName: 'Read', content: makeVariedTokenText(6_000) }]),
+      makeBlobEntry('user', makeVariedTokenText(6_000)),
+      ...makeToolGroup({ callId: 'call_a2', toolName: 'Read', input: { path: 'b.ts' }, resultTokens: 6_000 }),
+    ]
+
+    for (const form of [openAiForm, anthropicForm]) {
+      const plan = planCompaction([...makeLeadingEntries(), ...form], { contextTokenLimit: 258_400, budgetOverride: 8_000 })
+      expectNoSplitToolPairsInPlan(plan)
+      // 锚点回溯会复制一条 user 指令进尾窗 (双保险), 总数 = body + (anchorInserted ? 1 : 0)
+      expect(plan.summarizeEntries.length + plan.keepTail.length).toBe(form.length + (plan.diagnostics.anchorInserted ? 1 : 0))
+    }
+  })
+
+  it('#26 孤儿断言: repair 漏网的错序工具链被切分后断言捕获并回退安全边界 (不崩溃)', () => {
+    // assistant(tool_use) 与其 result 之间插入 user 文本 → 分组后 result 成为独立组,
+    // 预算扫描可能把切点落在 use 与 result 之间 → 断言回退直到配对同侧
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(500)),
+      makeBlobEntry('assistant', [
+        { type: 'text', text: '调用工具' },
+        { type: 'tool_use', id: 'call_orphan', name: 'Read', input: { path: 'x.ts' } },
+      ]),
+      makeBlobEntry('user', makeVariedTokenText(200)), // 插入文本拆开 use 与 result
+      makeBlobEntry('tool', makeVariedTokenText(60), { toolCallId: 'call_orphan', toolName: 'Read' }),
+      makeBlobEntry('assistant', makeVariedTokenText(4_000)),
+    ]
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 4_000 })
+    expectNoSplitToolPairsInPlan(plan)
+  })
+})
+
+describe('#3/#4 预算边界与最小保留兜底', () => {
+  it('#3 恰好等于/超一条/全超: chosenCut 单调且确定性', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(3_000)),
+      makeBlobEntry('assistant', makeVariedTokenText(3_000)),
+      makeBlobEntry('user', makeVariedTokenText(3_000)),
+      makeBlobEntry('assistant', makeVariedTokenText(3_000)),
+    ]
+    // 确定性: 同输入两次规划完全一致
+    const planOnce = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 8_000 })
+    const planTwice = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 8_000 })
+    expect(planOnce.summarizeEntries.length).toBe(planTwice.summarizeEntries.length)
+    expect(planOnce.keepTail.map(e => e.blobId)).toEqual(planTwice.keepTail.map(e => e.blobId))
+    // 单调: 预算减半 → keepTail 条数不增
+    const planTighter = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 4_000 })
+    expect(planTighter.keepTail.length).toBeLessThanOrEqual(planOnce.keepTail.length)
+    // 全超: 每条都超预算 → 兜底保住最后一组
+    const planAll = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 1_000 })
+    expect(planAll.keepTail.length).toBeGreaterThanOrEqual(1)
+    expectNoSplitToolPairsInPlan(planAll)
+  })
+
+  it('#4 最近一轮含 100K 巨物 (前沿): 强制保留该轮, 接受超支', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(1_000)),
+      ...makeToolGroup({ callId: 'call_huge', toolName: 'Read', input: { path: 'huge.ts' }, resultTokens: 100_000 }),
+    ]
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 5_000 })
+    // 前沿 (最后一条 assistant 及其后) 永不占位 → 该轮完整保留 (锚点副本 + 配对组)
+    expect(plan.keepTail.length).toBeGreaterThanOrEqual(2)
+    const toolEntry = plan.keepTail[plan.keepTail.length - 1]!
+    expect(toolEntry.message.role).toBe('tool')
+    expect(toolEntry.message.toolCallId).toBe('call_huge')
+    expect(plan.diagnostics.placeholderCount).toBe(0)
+    expect(plan.diagnostics.frontierExcessTokens).toBeGreaterThan(0)
+  })
+})
+
+describe('#5/#6 图片豁免与占位符内容', () => {
+  it('#5 含 image block 的 tool_result: 不占位不截断, 按 1.6K/块计价', () => {
+    const imageEntry = makeBlobEntry('user', [
+      { type: 'tool_result', toolUseId: 'call_img', toolName: 'Read', content: 'screenshot attached' },
+      { type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' },
+    ])
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(1_000)),
+      makeBlobEntry('assistant', [{ type: 'tool_use', id: 'call_img', name: 'Read', input: { path: 'shot.png' } }]),
+      imageEntry,
+      // 真实 user 消息紧跟其后: 尾窗自带锚点, 避免锚点回溯重扫把图片组挤出尾窗
+      makeBlobEntry('user', 'please analyze this screenshot'),
+      ...makeToolGroup({ callId: 'call_after', toolName: 'Read', input: { path: 'z.ts' }, resultTokens: 50 }),
+      makeBlobEntry('assistant', 'done'),
+    ]
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 3_000 })
+    expect(plan.diagnostics.placeholderCount).toBe(0)
+    const keptImageEntry = plan.keepTail.find(entry => entry === imageEntry || entry.blobId === imageEntry.blobId)
+    expect(keptImageEntry).toBeTruthy()
+    expect(Array.isArray(keptImageEntry!.message.content)).toBe(true)
+    // 计价含 1600/块
+    const imageEntryMeasured = measureMessagesTokens([imageEntry.message])
+    expect(imageEntryMeasured).toBeGreaterThanOrEqual(1_600)
+  })
+
+  it('#6 占位符内容: Read/Task/Shell 三类均含 ~N tokens / locator / blobId / 恢复指引 / 头尾预览', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(500)),
+    ]
+    // 前置历史确保摘要侧非空 (占位后的尾窗很小, 不加会整体装入预算 → no-op)
+    pushBulkHistory(entries, 6, 8_000)
+    entries.push(...makeToolGroup({ callId: 'call_r', toolName: 'Read', input: { path: '/repo/src/big.ts' }, resultTokens: 30_000 }))
+    entries.push(...makeToolGroup({
+      callId: 'call_t',
+      toolName: 'Task',
+      input: { prompt: 'explore repo' },
+      resultTokens: 30_000,
+      resultText: `Subagent report\n[Subagent transcript: /tmp/t.jsonl]\n${makeVariedTokenText(29_000)}`,
+    }))
+    entries.push(...makeToolGroup({
+      callId: 'call_s',
+      toolName: 'Shell',
+      input: { command: 'pnpm build' },
+      resultTokens: 30_000,
+      resultText: `[output written to /tmp/build-overflow.log]\n${makeVariedTokenText(29_000)}`,
+    }))
+    entries.push(makeBlobEntry('assistant', 'analysis done')) // 使三组全部脱离前沿
+
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 4_000 })
+    expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+    expect(plan.diagnostics.placeholderCount).toBe(3)
+
+    const placeholderTexts = plan.keepTail
+      .filter(entry => typeof entry.message.content === 'string' && entry.message.content.includes('[tool output elided'))
+      .map(entry => entry.message.content as string)
+    expect(placeholderTexts.length).toBe(3)
+    for (const text of placeholderTexts) {
+      expect(text).toMatch(/~\d+ tokens\]/)
+      expect(text).toContain('[full content archived in blob ')
+      expect(text).toContain('[to recover: re-run the tool, or ask the user]')
+      expect(text).toContain('--- preview (head + tail) ---')
+      expect(text).toContain('…[middle elided]…')
+    }
+    const readPlaceholder = placeholderTexts.find(text => text.includes('/repo/src/big.ts'))
+    expect(readPlaceholder).toBeTruthy()
+    expect(readPlaceholder).toMatch(/totalLines=\d+/)
+    const taskPlaceholder = placeholderTexts.find(text => text.includes('Task agentId'))
+    expect(taskPlaceholder).toBeTruthy()
+    expect(taskPlaceholder).toContain('/tmp/t.jsonl')
+    const shellPlaceholder = placeholderTexts.find(text => text.includes('Shell command'))
+    expect(shellPlaceholder).toBeTruthy()
+    expect(shellPlaceholder).toContain('pnpm build')
+    // 预览 token 封顶: 占位符整体 < 700 tok (头 175 + 尾 75 + 骨架 + locator)
+    for (const text of placeholderTexts)
+      expect(countTokens(text)).toBeLessThan(700)
+  })
+})
+
+describe('#8/#9 多轮不退化与两路一致', () => {
+  it('#8 连续 3 次压缩: 地板不单调上升, archive 不含重复条目', () => {
+    let entries: HistoryEntry[] = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(800)),
+    ]
+    for (let index = 0; index < 30; index++)
+      entries.push(...makeToolGroup({ callId: `call_r8_${index}`, toolName: 'Read', input: { path: `f${index}.ts` }, resultTokens: 5_000 }))
+
+    const floorHistory: number[] = []
+    const archivedBlobIdsAcrossRounds = new Set<string>()
+    for (let round = 0; round < 3; round++) {
+      const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+      expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+      const artifacts = createCompactionArtifacts({
+        plan,
+        summaryText: `- round ${round} summary of the work done`,
+        previousSummaryArchiveIds: [],
+      })
+      floorHistory.push(plan.diagnostics.leadingTokens + plan.diagnostics.summaryReserveTokens + plan.diagnostics.keepTailActualTokens)
+
+      if (artifacts.archiveBlobs.length > 0) {
+        const archiveMessage = fromBinary(ConversationSummaryArchiveSchema, Buffer.from(artifacts.archiveBlobs[0]!.blobData, 'base64'))
+        const archivedIds = archiveMessage.summarizedMessages.map(ids => Buffer.from(ids).toString('utf8'))
+        for (const archivedId of archivedIds) {
+          // archive 不重复收录同一条目 (旧 Σ 不再进档 → 不滚雪球)
+          expect(archivedBlobIdsAcrossRounds.has(archivedId), `archive duplicate: ${archivedId}`).toBe(false)
+          archivedBlobIdsAcrossRounds.add(archivedId)
+        }
+        // Σ blob 自身绝不入档
+        expect(archivedIds).not.toContain(artifacts.summaryBlobId)
+      }
+      // 下一轮从压缩后的 root 重新 hydrate (Σ 带标记), 并追加新一轮工具流
+      const nextEntries = hydrateHistoryEntries(artifacts.nextRootBlobIds)
+      expect(nextEntries.length).toBe(plan.leading.length + 1 + plan.keepTail.length)
+      for (let index = 0; index < 8; index++)
+        nextEntries.push(...makeToolGroup({ callId: `call_r8_${round}_${index}`, toolName: 'Read', input: { path: `g${index}.ts` }, resultTokens: 5_000 }))
+      entries = repairHistoryEntries(nextEntries)
+    }
+    // 地板允许小幅波动但不得单调上升 (轮 3 ≤ 轮 1 + 摘要余量)
+    expect(floorHistory[2]).toBeLessThanOrEqual(floorHistory[0] + 2_000)
+  })
+
+  it('#9 两路一致: 同一 entries 相同 options 两次规划完全相同', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(600)),
+      ...makeToolGroup({ callId: 'call_c9', toolName: 'Read', input: { path: 'c9.ts' }, resultTokens: 20_000 }),
+      makeBlobEntry('assistant', 'summary of findings'),
+    ]
+    const inlinePlan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    const actionPlan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    expect(inlinePlan.mode).toBe(actionPlan.mode)
+    expect(inlinePlan.summarizeEntries.map(e => e.blobId)).toEqual(actionPlan.summarizeEntries.map(e => e.blobId))
+    expect(inlinePlan.keepTail.map(e => e.blobId)).toEqual(actionPlan.keepTail.map(e => e.blobId))
+    expect(inlinePlan.elidedOriginals).toEqual(actionPlan.elidedOriginals)
+  })
+})
+
+describe('#10/#24 小窗: clamp / B 模式 / 禁用', () => {
+  it('#10/#24-1 32K 窗 + 15K leading: 走 B 模式 (全量摘要 + 锚点单条)', () => {
+    const bigLeading = [
+      makeBlobEntry('system', makeVariedTokenText(14_000)),
+      makeBlobEntry('user', `<user_info>\n${makeVariedTokenText(1_000)}\n</user_info>`),
+    ]
+    const entries = [
+      ...bigLeading,
+      makeBlobEntry('user', 'fix the build error'),
+      ...makeToolGroup({ callId: 'call_s32', toolName: 'Read', input: { path: 's.ts' }, resultTokens: 2_000 }),
+    ]
+    const plan = planCompaction(entries, { contextTokenLimit: 32_000 })
+    expect(plan.mode).toBe('b-mode')
+    // 全量摘要 (锚点除外) + 锚点单条尾窗
+    expect(plan.summarizeEntries.map(entry => entry.message.role)).toEqual(['assistant', 'tool'])
+    expect(plan.keepTail.length).toBe(1)
+    expect(plan.keepTail[0]!.message.role).toBe('user')
+    expect(plan.keepTail[0]!.message.content).toContain('fix the build error')
+    expect(plan.anchorBlobId).toBe(plan.keepTail[0]!.blobId)
+  })
+
+  it('#24-2 leading 过大 (~28K on 32K 窗): 禁用自动压缩 (拒动为合格终态)', () => {
+    const hugeLeading = [
+      makeBlobEntry('system', makeVariedTokenText(27_500)),
+      makeBlobEntry('user', `<user_info>\n${makeVariedTokenText(1_000)}\n</user_info>`),
+    ]
+    const entries = [
+      ...hugeLeading,
+      makeBlobEntry('user', 'do something'),
+      ...makeToolGroup({ callId: 'call_d32', toolName: 'Read', input: { path: 'd.ts' }, resultTokens: 500 }),
+    ]
+    const plan = planCompaction(entries, { contextTokenLimit: 32_000 })
+    expect(plan.mode).toBe('disabled')
+    expect(plan.summarizeEntries.length).toBe(0)
+  })
+
+  it('#10-3 32K 窗正常 leading: budget 模式可用 (targetFloor − leading − reserve 路径)', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(400)),
+      ...makeToolGroup({ callId: 'call_n32', toolName: 'Read', input: { path: 'n.ts' }, resultTokens: 6_000 }),
+      ...makeToolGroup({ callId: 'call_n32b', toolName: 'Read', input: { path: 'n2.ts' }, resultTokens: 6_000 }),
+    ]
+    const plan = planCompaction(entries, { contextTokenLimit: 32_000 })
+    expect(plan.mode).toBe('budget')
+    // targetFloor 8K − leading − reserve ≈ 7.3K (未触底 min(8K, 5%×32K)=1.6K)
+    expect(plan.diagnostics.budgetTokens).toBeGreaterThan(1_600)
+    expect(plan.diagnostics.budgetTokens).toBeLessThanOrEqual(8_000)
+  })
+})
+
+describe('#12/#13/#29 中文预算 / 性能冒烟 / 组边界', () => {
+  it('#12 中文预算: 等 token 量中文工具流在 o200k 计数下不超预算', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', '请重构这个模块'),
+    ]
+    for (let index = 0; index < 30; index++) {
+      entries.push(...makeToolGroup({
+        callId: `call_cjk_${index}`,
+        toolName: 'Read',
+        input: { path: `文件${index}.ts` },
+        resultTokens: 4_000,
+        resultText: makeTokenSizedChineseText(4_000),
+      }))
+    }
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+    // o200k 计价下 keepTail 受预算约束 (chars/4 会低估 4x 导致超支 — 修正后不超)
+    expect(plan.diagnostics.keepTailActualTokens).toBeLessThanOrEqual(plan.diagnostics.budgetTokens + 2_000)
+    expectNoSplitToolPairsInPlan(plan)
+  })
+
+  it('#13 性能冒烟: 200 条 (100 组) planCompaction < 1s', () => {
+    const entries = [...makeLeadingEntries()]
+    for (let index = 0; index < 100; index++)
+      entries.push(...makeToolGroup({ callId: `call_perf_${index}`, toolName: 'Read', input: { path: `p${index}.ts` }, resultTokens: 1_200 }))
+    expect(entries.length).toBe(202)
+
+    const startedAt = Date.now()
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    const elapsedMs = Date.now() - startedAt
+    expect(elapsedMs).toBeLessThan(1_000)
+    expect(plan.mode).toBe('budget')
+  }, 15_000)
+
+  it('#29 纯工具流 70 组 (无任何 v1-safe 消息): 切点落在预算允许的最深组边界, 不钉死于 Σ/锚点', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', 'run the migration'),
+    ]
+    for (let index = 0; index < 70; index++)
+      entries.push(...makeToolGroup({ callId: `call_g29_${index}`, toolName: 'Read', input: { path: `m${index}.ts` }, resultTokens: 3_000 }))
+
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    expect(plan.mode).toBe('budget')
+    // 真实切分发生: 摘要侧与尾窗均非空 (v1 谓词在此场景会钉死切点 → 尾窗无界累积)
+    expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+    expect(plan.keepTail.length).toBeGreaterThan(2)
+    expect(plan.diagnostics.keepTailActualTokens).toBeLessThanOrEqual(plan.diagnostics.budgetTokens + 2_000)
+    expectNoSplitToolPairsInPlan(plan)
+    // 锚点: 尾窗无真 user → 指令锚点被回溯插入头部 (双保险)
+    expect(plan.diagnostics.anchorInserted).toBe(true)
+    expect(plan.keepTail[0]!.message.role).toBe('user')
+  })
+})
+
+describe('#20/#21/#22/#23/#27/#28/#32 锚点 / 前沿 / 输入侧 / 升级链', () => {
+  it('#20 指令锚点保底 + canonical 地板: 40×3K 对抗序列, 地板 ≤ 承诺', () => {
+    const instructionText = `<user_query>\nrefactor the auth module and add tests\n</user_query>\n${makeVariedTokenText(700)}`
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', instructionText),
+    ]
+    // 70 轮工具流, 其中 40 组为 3K 中等消息 (对抗序列: 不触发巨物占位)
+    for (let index = 0; index < 70; index++)
+      entries.push(...makeToolGroup({ callId: `call_c20_${index}`, toolName: 'Read', input: { path: `a${index}.ts` }, resultTokens: index < 40 ? 3_000 : 2_000 }))
+
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    expect(plan.mode).toBe('budget')
+    // 指令原文存活于尾窗头部 (锚点, 不截断)
+    expect(plan.keepTail[0]!.message.role).toBe('user')
+    expect(plan.keepTail[0]!.message.content).toBe(instructionText)
+    // 双保险: 指令同时存在于摘要侧 (不移除)
+    expect(plan.summarizeEntries.some(entry => entry.message.content === instructionText)).toBe(true)
+    // archive 不含锚点 blobId
+    expect(plan.anchorBlobId).toBeTruthy()
+    expect(plan.elidedOriginals).not.toContain(plan.anchorBlobId)
+    // tool_result 载体不被误选为锚点
+    expect(plan.keepTail[0]!.message.toolCallId).toBeUndefined()
+    // canonical 地板: 消息侧 ≤ 承诺地板 (targetFloor × 1.2)
+    const occupancy = plan.diagnostics.leadingTokens + plan.diagnostics.summaryReserveTokens + plan.diagnostics.keepTailActualTokens
+    expect(occupancy).toBeLessThanOrEqual(Math.floor(0.25 * 258_400 * 1.2))
+  })
+
+  it('#21 因果前沿豁免: 40K 结果刚落地不被占位; 消费一轮后再压缩则被占位 (单轮自愈)', () => {
+    const baseEntries = (): HistoryEntry[] => {
+      const entries = [
+        ...makeLeadingEntries(),
+        makeBlobEntry('user', makeVariedTokenText(500)),
+      ]
+      pushBulkHistory(entries, 6, 8_000)
+      entries.push(...makeToolGroup({ callId: 'call_f21', toolName: 'Read', input: { path: 'fresh.ts' }, resultTokens: 40_000 }))
+      return entries
+    }
+    // 场景 A: 结果是最后一条 (未消费) → 前沿豁免, 原文留尾窗
+    const planFresh = planCompaction(baseEntries(), { contextTokenLimit: 258_400, budgetOverride: 5_000 })
+    expect(planFresh.summarizeEntries.length).toBeGreaterThan(0)
+    expect(planFresh.diagnostics.placeholderCount).toBe(0)
+    expect(planFresh.keepTail.some(entry => entry.message.toolCallId === 'call_f21'
+      && typeof entry.message.content === 'string' && !entry.message.content.includes('[tool output elided'))).toBe(true)
+    expect(planFresh.diagnostics.frontierExcessTokens).toBeGreaterThan(0)
+
+    // 场景 B: 追加 assistant (模拟消费) → 脱离前沿 → 可占位
+    const consumedEntries = [...baseEntries(), makeBlobEntry('assistant', 'I have read the file, continuing')]
+    const planConsumed = planCompaction(consumedEntries, { contextTokenLimit: 258_400, budgetOverride: 5_000 })
+    expect(planConsumed.summarizeEntries.length).toBeGreaterThan(0)
+    expect(planConsumed.diagnostics.placeholderCount).toBe(1)
+    // 首次消费损失恒 0 (前沿豁免回归指标)
+    expect(planConsumed.diagnostics.firstConsumptionLossCount).toBe(0)
+    expect(planFresh.diagnostics.firstConsumptionLossCount).toBe(0)
+  })
+
+  it('#22 锚点计价: 20K 长指令触发锚点回溯, 以扣减预算重扫, 指令不截断', () => {
+    const longInstruction = `Please carefully refactor the entire authentication subsystem ${makeVariedTokenText(19_000)}`
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', longInstruction),
+    ]
+    for (let index = 0; index < 40; index++)
+      entries.push(...makeToolGroup({ callId: `call_c22_${index}`, toolName: 'Read', input: { path: `b${index}.ts` }, resultTokens: 3_000 }))
+
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    expect(plan.diagnostics.anchorInserted).toBe(true)
+    // 指令原文完整 (不截断)
+    expect(plan.keepTail[0]!.message.content).toBe(longInstruction)
+    // 锚点计入预算: keepTail (含 20K 锚点) 受预算 + 锚点超额约束
+    expect(plan.diagnostics.keepTailActualTokens).toBeLessThanOrEqual(plan.diagnostics.budgetTokens + 21_000)
+  })
+
+  it('#23 渲染后计价: 中文巨物 + 超长路径 — 占位符实测 token = 计价值 (账面=实际)', () => {
+    const longPath = `/very/long/nested/directory/structure/that/keeps/going/${'segment/'.repeat(60)}file.ts`
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(300)),
+    ]
+    pushBulkHistory(entries, 6, 8_000)
+    entries.push(...makeToolGroup({
+      callId: 'call_c23',
+      toolName: 'Read',
+      input: { path: longPath },
+      resultTokens: 30_000,
+      resultText: makeTokenSizedChineseText(30_000),
+    }))
+    entries.push(makeBlobEntry('assistant', 'done reading'))
+
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 3_000 })
+    expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+    expect(plan.diagnostics.placeholderCount).toBe(1)
+    // keepTail 实测 = 诊断里的 keepTailActualTokens (同一把尺子, 账面=实际)
+    const remeasured = measureMessagesTokens(plan.keepTail.map(entry => entry.message))
+    expect(remeasured).toBe(plan.diagnostics.keepTailActualTokens)
+    // CJK 预览 token 封顶: 占位符 < 900 tok (头175+尾75+骨架+超长路径)
+    const placeholderEntry = plan.keepTail.find(entry =>
+      typeof entry.message.content === 'string' && entry.message.content.includes('[tool output elided'))!
+    expect(countTokens(placeholderEntry.message.content as string)).toBeLessThan(900)
+    expect(placeholderEntry.message.content).toContain(longPath)
+  })
+
+  it('#27 输入侧占位: assistant 含 30K Write.contents → 字段省略标记替换, id/name/path 原样', () => {
+    const entries = [
+      ...makeLeadingEntries(),
+      makeBlobEntry('user', makeVariedTokenText(300)),
+    ]
+    pushBulkHistory(entries, 6, 8_000)
+    entries.push(makeBlobEntry('assistant', [
+      { type: 'text', text: 'writing the file now' },
+      { type: 'tool_use', id: 'call_w27', name: 'Write', input: { path: '/repo/new-file.ts', contents: makeVariedTokenText(30_000) } },
+    ]))
+    entries.push(makeBlobEntry('tool', 'File written successfully', { toolCallId: 'call_w27', toolName: 'Write' }))
+    entries.push(makeBlobEntry('assistant', 'file created'))
+
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: 3_000 })
+    expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+    expect(plan.diagnostics.inputElidedCount).toBe(1)
+    const elidedAssistant = plan.keepTail.find(entry =>
+      Array.isArray(entry.message.content)
+      && entry.message.content.some(block => typeof block === 'object' && 'input' in block
+        && typeof (block as { input: Record<string, unknown> }).input.contents === 'string'
+        && ((block as { input: Record<string, unknown> }).input.contents as string).includes('elided during context compaction')))
+    expect(elidedAssistant).toBeTruthy()
+    const toolUseBlock = (elidedAssistant!.message.content as LLMContentBlock[]).find(block => block.type === 'tool_use') as Extract<LLMContentBlock, { type: 'tool_use' }>
+    // id / name / path 原样保留
+    expect(toolUseBlock.id).toBe('call_w27')
+    expect(toolUseBlock.name).toBe('Write')
+    expect(toolUseBlock.input.path).toBe('/repo/new-file.ts')
+    // locator 指向磁盘文件
+    expect(toolUseBlock.input.contents).toMatch(/recover from the file at \/repo\/new-file\.ts/)
+    // 配对完整
+    expectNoSplitToolPairsInPlan(plan)
+  })
+
+  it('#28 输入侧前沿豁免: 最后一条 assistant 含大 tool_use 不省略; 消费后可省略', () => {
+    const baseEntries = (): HistoryEntry[] => {
+      const entries = [
+        ...makeLeadingEntries(),
+        makeBlobEntry('user', makeVariedTokenText(300)),
+      ]
+      pushBulkHistory(entries, 6, 8_000)
+      entries.push(makeBlobEntry('assistant', [
+        { type: 'tool_use', id: 'call_w28', name: 'Write', input: { path: '/repo/frontier.ts', contents: makeVariedTokenText(30_000) } },
+      ]))
+      return entries
+    }
+    // 场景 A: 该 assistant 是最后一条 → 前沿, 不省略
+    const planFrontier = planCompaction(baseEntries(), { contextTokenLimit: 258_400, budgetOverride: 3_000 })
+    expect(planFrontier.summarizeEntries.length).toBeGreaterThan(0)
+    expect(planFrontier.diagnostics.inputElidedCount).toBe(0)
+    // 场景 B: 追加消费 (tool result + assistant) → 可省略
+    const consumedEntries = [
+      ...baseEntries(),
+      makeBlobEntry('tool', 'File written', { toolCallId: 'call_w28', toolName: 'Write' }),
+      makeBlobEntry('assistant', 'written'),
+    ]
+    const planConsumed = planCompaction(consumedEntries, { contextTokenLimit: 258_400, budgetOverride: 3_000 })
+    expect(planConsumed.summarizeEntries.length).toBeGreaterThan(0)
+    expect(planConsumed.diagnostics.inputElidedCount).toBe(1)
+  })
+
+  it('#32 违约就地升级链: 实占 > 承诺×1.2 → 依次升级至 B 模式, 每级确定性终止', () => {
+    // leading 80K (超 targetFloor 64.6K) + 图片巨物尾窗 (不可占位) → 违约穿透升级链 → B 模式终态
+    const hugeLeading = [
+      makeBlobEntry('system', makeVariedTokenText(79_000)),
+      makeBlobEntry('user', `<user_info>\n${makeVariedTokenText(1_000)}\n</user_info>`),
+    ]
+    const entries = [
+      ...hugeLeading,
+      makeBlobEntry('user', 'keep working on the images'),
+    ]
+    for (let index = 0; index < 8; index++) {
+      entries.push(makeBlobEntry('assistant', [{ type: 'tool_use', id: `call_i32_${index}`, name: 'Read', input: { path: `img${index}.png` } }]))
+      entries.push(makeBlobEntry('user', [
+        { type: 'tool_result', toolUseId: `call_i32_${index}`, toolName: 'Read', content: 'screenshot' },
+        { type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' },
+      ]))
+    }
+    const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+    // 违约无法通过占位线/预算减半消除 (图片原子豁免) → B 模式终态
+    expect(plan.mode).toBe('b-mode')
+    expect(plan.diagnostics.escalationLevel).toBe('b-mode')
+    // B 模式地板 = 全量摘要 + 锚点单条
+    expect(plan.keepTail.length).toBe(1)
+    expect(plan.keepTail[0]!.message.role).toBe('user')
+  })
+})
+
+describe('#25 并发互斥 (compactionLock)', () => {
+  it('#25 inline 与 summarizeAction 并发: 后到 inline 跳过, 释放后 summarizeAction 可进入', async () => {
+    const conversationId = 'conv-mutex-25'
+    // inline 先拿到锁
+    expect(tryAcquireCompactionLock(conversationId)).toBe(true)
+    // 第二个尝试 (inline 语义) → 跳过并计数
+    expect(tryAcquireCompactionLock(conversationId)).toBe(false)
+    expect(tryAcquireCompactionLock(conversationId)).toBe(false)
+    expect(getCompactionContentionCount(conversationId)).toBe(2)
+    // summarizeAction 语义: 等待释放
+    let resumed = false
+    const waitPromise = waitForCompactionLockRelease(conversationId).then(() => {
+      resumed = true
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(resumed).toBe(false)
+    releaseCompactionLock(conversationId)
+    await waitPromise
+    expect(resumed).toBe(true)
+    // 释放后可重新获取
+    expect(tryAcquireCompactionLock(conversationId)).toBe(true)
+    releaseCompactionLock(conversationId)
+  })
+})
+
+//
 
 describe('sanity', () => {
   it('estimateMessagesTokens 可调用', () => {

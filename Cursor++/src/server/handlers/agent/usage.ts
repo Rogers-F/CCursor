@@ -1,4 +1,8 @@
 import type { LLMUsage } from '../llm/types';
+import {
+    AUTOCOMPACT_TRIGGER_RESERVE_MAX_TOKENS,
+    AUTOCOMPACT_TRIGGER_RESERVE_RATIO,
+} from './constants';
 
 export interface UsageTotals {
     inputTokens: number;
@@ -78,6 +82,19 @@ const MAX_OUTPUT_RESERVE = 20_000
  * 形成"读一个文件就压缩"的锯齿循环。逼近窗口上限的硬安全线可无视本门槛。
  */
 export const AUTOCOMPACT_NET_GROWTH_MIN_TOKENS = 15_000
+
+/**
+ * 第二阶段触发预留: 触发线 = 窗口 − min(40K, 15% × 窗口)。
+ *
+ * planCompaction 可行性检查 (阶段 3) 与 getAutoCompactThreshold 新公式 (阶段 5)
+ * 共享此函数。逐档值: 32K→27,200 / 64K→54,400 / 96K→81,600 /
+ * 128K→108,800 / 258.4K→219,640 / 1M→960,000。
+ */
+export function computeAutoCompactTriggerReserveTokens(maxTokens: number): number {
+    if (maxTokens <= 0)
+        return 0;
+    return Math.min(AUTOCOMPACT_TRIGGER_RESERVE_MAX_TOKENS, Math.floor(AUTOCOMPACT_TRIGGER_RESERVE_RATIO * maxTokens));
+}
 
 export function getAutoCompactThreshold(maxTokens: number, maxOutputTokens = 8192): number {
     const outputReserve = Math.min(maxOutputTokens, MAX_OUTPUT_RESERVE)

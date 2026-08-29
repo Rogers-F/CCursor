@@ -40,10 +40,82 @@ export const SHELL_TIMEOUT_BEHAVIOR_BACKGROUND = 2;
 // 避免兼容性较差的模型提供商 (如 GLM 不流式 tool_use) 导致 UI 看起来卡死。
 export const IDLE_HINT_AFTER_MS = 3_000;
 
-// Heuristic compaction policy:
+// Heuristic compaction policy (legacy, 条数定额):
 // preserve more recent turns uncompressed so continuation quality keeps short-term state.
 // These values are local policy choices, not protocol-defined by Cursor.
+//
+// @deprecated 第二阶段已切换为 token 预算制 (设计文档 §4/§5),
+// 保留仅作备选方案 (§3.3 灰度前置) 与回滚开关用, 勿在新代码引用。
 export const COMPACTION_MEDIUM_BODY_THRESHOLD = 2;
 export const COMPACTION_MEDIUM_BODY_KEEP_TAIL = 2;
 export const COMPACTION_LONG_BODY_THRESHOLD = 8;
 export const COMPACTION_LONG_BODY_KEEP_TAIL = 6;
+
+// ═══════════════════════════════════════════════════════════════════
+// 第二阶段: keepTail 预算化参数 (设计文档 §5 参数表, 唯一权威为该表)
+// 公式集中于此, planCompaction / usage / 摘要侧共享, 禁止散落内联数字。
+// ═══════════════════════════════════════════════════════════════════
+
+/** 触发线 = 窗口 − min(该值, 15% × 窗口)。审计三修正: 双轨 min(max−40K, 0.85max) 在小窗死带, 改为单一预留式 */
+export const AUTOCOMPACT_TRIGGER_RESERVE_MAX_TOKENS = 40_000;
+export const AUTOCOMPACT_TRIGGER_RESERVE_RATIO = 0.15;
+
+/** 压缩后地板目标 = 25% × 窗口 (258,400 窗 → 64,600) */
+export const TARGET_FLOOR_RATIO = 0.25;
+
+/** 摘要预留 = min(5K, 2% × 窗口) — 按窗口比例缩放 (审计四小窗修正) */
+export const SUMMARY_RESERVE_MAX_TOKENS = 5_000;
+export const SUMMARY_RESERVE_RATIO = 0.02;
+
+/** keepTail 预算 clamp 下限 = min(8K, 5% × 窗口); 上限固定 60K (1M 窗 25%=250K 失去压缩意义) */
+export const KEEP_TAIL_BUDGET_MIN_TOKENS = 8_000;
+export const KEEP_TAIL_BUDGET_MIN_RATIO = 0.05;
+export const KEEP_TAIL_BUDGET_MAX_TOKENS = 60_000;
+
+/** 巨物线 = max(4K, min(12K, 25% × budget)); 超线的 tool_result/大字段参与占位计价 */
+export const LARGE_ENTRY_MIN_TOKENS = 4_000;
+export const LARGE_ENTRY_MAX_TOKENS = 12_000;
+export const LARGE_ENTRY_BUDGET_RATIO = 0.25;
+
+/** 摘要输出硬上界 = 2 × summaryReserve (审计四: 官方 prompt 第 6 节随会话年龄单调增长) */
+export const SUMMARY_HARD_CAP_RESERVE_MULTIPLE = 2;
+
+/** 占位预览 = 头 175 tok + 尾 75 tok (token 封顶, CJK 不击穿; 尾部信息密度高) */
+export const PLACEHOLDER_PREVIEW_HEAD_TOKENS = 175;
+export const PLACEHOLDER_PREVIEW_TAIL_TOKENS = 75;
+
+/**
+ * 图片计价 = 1,600 tok/块。
+ * 校准清单项: 非跨 provider 普适常数 (审计二 Gemini 小图实测 ~258 tok/图),
+ * 由 o200k vs provider usage 观测差校准; 仅用于预算计价, 不用于计费。
+ */
+export const IMAGE_BILLED_TOKENS = 1_600;
+
+/** 违约判定 = 实占 > 承诺地板 × 1.2 (扣除因果前沿超额后) */
+export const FLOOR_VIOLATION_RATIO = 1.2;
+
+/** 预算安全边际: o200k 是校准估计器 (非 OpenAI 系偏差 10-15%), 计价乘 1.15 由观测校准 */
+export const BUDGET_SAFETY_MARGIN = 1.15;
+
+/** 可行性检查的输出预留 (对齐 usage.MAX_OUTPUT_RESERVE 量级, planCompaction 不感知 maxOutputTokens) */
+export const FEASIBILITY_OUTPUT_RESERVE_TOKENS = 20_000;
+
+/** 摘要源总预算 = min(0.6 × 窗口 × 4, 3.2e6) chars; min-quota 200 chars (官方 CC-012) */
+export const SUMMARY_SOURCE_WINDOW_RATIO = 0.6;
+export const SUMMARY_SOURCE_MAX_CHARS = 3_200_000;
+export const SUMMARY_SOURCE_MIN_QUOTA_CHARS = 200;
+
+/** 摘要三级兜底 (官方 CC-011 库参数全量接线, 官方生产只接线两级) */
+export const SUMMARY_RETRY_MAX_ATTEMPTS = 3;
+export const SUMMARY_RETRY_MIN_BUDGET_CHARS = 50_000;
+export const SUMMARY_RETRY_MAX_INPUT_RATIO = 0.75;
+/** 确定性降级预算 = clamp(窗口 × 2% × 4, 50K, 3.2e6) chars */
+export const SUMMARY_FALLBACK_WINDOW_RATIO = 0.02;
+export const SUMMARY_FALLBACK_MIN_CHARS = 50_000;
+export const SUMMARY_FALLBACK_MAX_CHARS = 3_200_000;
+
+/** 错误驱动压缩重试上限 (官方 5 轮, BYOK 单轮成本更高取保守值) */
+export const CONTEXT_LENGTH_RETRY_MAX = 3;
+
+/** 入口截断 (阶段 1): ENTRY_CAP = min(25K tok, 25% × 窗口) */
+export const TASK_ENTRY_CAP_RATIO = 0.25;

@@ -122,47 +122,83 @@ it('computeContextUsagePercent computes correctly', () => {
   expect(computeContextUsagePercent(100000, 100000)).toBe(100)
 })
 
-// ─── planCompaction tests ───
+// ─── planCompaction tests (第二阶段: token 预算制, 原"按条数"断言改为预算断言) ───
+
+function makeVariedFiller(chars: number): string {
+  const words = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta', 'iota', 'kappa']
+  let text = ''
+  let wordIndex = 0
+  while (text.length < chars)
+    text += `${words[wordIndex++ % words.length]} `
+  return text
+}
+
+function makeLargeHistoryEntries(count: number, opts?: { withSystem?: boolean, withPreamble?: boolean, tokensPerEntry?: number }): HistoryEntry[] {
+  const tokensPerEntry = opts?.tokensPerEntry ?? 6_000
+  const entries: HistoryEntry[] = []
+  if (opts?.withSystem) {
+    entries.push(makeBlobEntry('system', 'You are a helpful assistant.'))
+  }
+  if (opts?.withPreamble) {
+    entries.push(makeBlobEntry('user', '<user_info>\nUser context here\n</user_info>'))
+  }
+  for (let i = 0; i < count; i++) {
+    const role = i % 2 === 0 ? 'user' : 'assistant'
+    const content = `${role === 'user' ? 'User message' : 'Assistant response'} ${Math.floor(i / 2) + 1}: ${makeVariedFiller(tokensPerEntry * 5)}`
+    entries.push(makeBlobEntry(role, content))
+  }
+  return entries
+}
 
 it('planCompaction preserves system and preamble in leading', () => {
-  const entries = makeHistoryEntries(10, { withSystem: true, withPreamble: true })
-  const plan = planCompaction(entries)
+  // 258,400 窗 + 10×5K tok: budget ≈ 44K, 扫描后只保留尾部若干组, 但 leading 恒完整保留
+  const entries = makeLargeHistoryEntries(10, { withSystem: true, withPreamble: true })
+  const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
 
   expect(plan.leading.length).toBe(2)
   expect(plan.leading[0].message.role).toBe('system')
   expect((plan.leading[1].message.content as string).includes('<user_info>')).toBe(true)
-  expect(plan.summarizeEntries.length > 0).toBeTruthy()
-  expect(plan.keepTail.length > 0).toBeTruthy()
+  expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+  expect(plan.keepTail.length).toBeGreaterThan(0)
+  // 预算断言: keepTail 实占 (o200k) 不超过预算 + 安全边际余量
+  expect(plan.diagnostics.keepTailActualTokens).toBeLessThanOrEqual(plan.diagnostics.budgetTokens + 1_000)
 })
 
 it('planCompaction keeps system+preamble in leading, compacts body', () => {
-  // With system + preamble + 1 body entry:
-  // leading = [system, preamble], body = [1 entry]
-  // body.length=1 <= MEDIUM(2), keepTailCount=0, summarizeCount=1
-  // So even a single body entry gets marked for summarize
+  // 预算制下 1 条小 body 全部落在预算内 → 无需压缩 (旧"条数定额"会把单条也标记摘要)
   const entries = makeHistoryEntries(1, { withSystem: true, withPreamble: true })
-  const plan = planCompaction(entries)
+  const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
 
   expect(plan.leading.length).toBe(2) // system + preamble
-  expect(plan.summarizeEntries.length + plan.keepTail.length).toBe(1)
+  expect(plan.summarizeEntries.length).toBe(0)
+  expect(plan.keepTail.length).toBe(1)
+  expect(plan.mode).toBe('budget')
 })
 
-it('planCompaction splits medium conversations correctly', () => {
-  const entries = makeHistoryEntries(6, { withSystem: true })
-  // body = 6 entries (excl system), body.length > MEDIUM_THRESHOLD(2)
-  const plan = planCompaction(entries)
+it('planCompaction splits medium conversations correctly (预算断言)', () => {
+  // 6 条 × 5K tok ≈ 30K, budget ≈ 44K → 全部装得下 → 不压缩;
+  // 加大单条体积到 15K tok (6×15K=90K > 44K) → 必须切分
+  const fitsEntirely = makeLargeHistoryEntries(6, { withSystem: true, tokensPerEntry: 5_000 })
+  const planNoop = planCompaction(fitsEntirely, { contextTokenLimit: 258_400 })
+  expect(planNoop.summarizeEntries.length).toBe(0)
 
+  const oversized = makeLargeHistoryEntries(6, { withSystem: true, tokensPerEntry: 15_000 })
+  const plan = planCompaction(oversized, { contextTokenLimit: 258_400 })
   expect(plan.leading.length).toBe(1) // system
-  expect(plan.summarizeEntries.length > 0).toBeTruthy()
-  expect(plan.keepTail.length >= 2).toBeTruthy()
+  expect(plan.summarizeEntries.length).toBeGreaterThan(0)
+  expect(plan.keepTail.length).toBeGreaterThan(0)
   expect(plan.summarizeEntries.length + plan.keepTail.length).toBe(6)
+  // keepTail 实占受预算约束 (中等工作集: 15K/条, 不足以触发巨物占位)
+  expect(plan.diagnostics.keepTailActualTokens).toBeLessThanOrEqual(plan.diagnostics.budgetTokens + 2_000)
 })
 
 // ─── createCompactionArtifacts tests ───
 
 it('createCompactionArtifacts produces valid summary blob and archive', () => {
-  const entries = makeHistoryEntries(10, { withSystem: true, withPreamble: true })
-  const plan = planCompaction(entries)
+  // 20×5K tok 超出 44K 预算 → 产生真实的摘要侧 + archive
+  const entries = makeLargeHistoryEntries(20, { withSystem: true, withPreamble: true })
+  const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+  expect(plan.summarizeEntries.length).toBeGreaterThan(0)
 
   const artifacts = createCompactionArtifacts({
     plan,
@@ -188,8 +224,9 @@ it('createCompactionArtifacts produces valid summary blob and archive', () => {
 })
 
 it('createCompactionArtifacts preserves previous summary archive IDs', () => {
-  const entries = makeHistoryEntries(10, { withSystem: true })
-  const plan = planCompaction(entries)
+  const entries = makeLargeHistoryEntries(20, { withSystem: true })
+  const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
+  expect(plan.summarizeEntries.length).toBeGreaterThan(0)
 
   const artifacts = createCompactionArtifacts({
     plan,
@@ -276,11 +313,12 @@ it('estimateMessagesTokens provides reasonable estimates', () => {
 // ─── End-to-end compaction flow test ───
 
 it('end-to-end: compaction reduces blob count and token estimate', () => {
-  const entries = makeHistoryEntries(20, { withSystem: true, withPreamble: true })
+  // 20×5K tok ≈ 100K var-tokens > 44K 预算 → 真实压缩
+  const entries = makeLargeHistoryEntries(20, { withSystem: true, withPreamble: true })
   const originalBlobIds = entries.map(e => e.blobId)
   const originalTokenEstimate = estimateMessagesTokens(entries.map(e => e.message))
 
-  const plan = planCompaction(entries)
+  const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
   expect(plan.summarizeEntries.length > 0, 'should have entries to summarize').toBeTruthy()
 
   const artifacts = createCompactionArtifacts({

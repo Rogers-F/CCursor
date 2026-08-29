@@ -78,20 +78,27 @@ it('shouldTriggerCompaction returns true at/above threshold', () => {
   expect(shouldTriggerCompaction(100000, 100000, 85)).toBe(true)
 })
 
-it('shouldTriggerCompaction default uses absolute buffer threshold', () => {
-  // 绝对 buffer 模式 (对齐 Claude Code):
-  //   threshold = maxTokens - min(maxOutputTokens, 20K outputReserve) - 20K buffer
-  // 默认 maxOutputTokens=8192 → 100K 模型 threshold = 100000 - 8192 - 20000 = 71808
-  expect(getAutoCompactThreshold(100000)).toBe(71808)
-  expect(shouldTriggerCompaction(71807, 100000)).toBe(false)
-  expect(shouldTriggerCompaction(71808, 100000)).toBe(true)
+it('shouldTriggerCompaction default uses new phase-2 threshold formula', () => {
+  // 第二阶段新公式: threshold = 窗口 − min(40K, 15% × 窗口)
+  // 100K 模型: 100000 − min(40000, 15000) = 85000
+  expect(getAutoCompactThreshold(100000)).toBe(85000)
+  expect(shouldTriggerCompaction(84999, 100000)).toBe(false)
+  expect(shouldTriggerCompaction(85000, 100000)).toBe(true)
 })
 
-it('getAutoCompactThreshold caps output reserve at 20K', () => {
-  // maxOutputTokens 超过 20K 时按 20K 计 — 200K 模型 threshold=160K (~80%, 基准)
-  expect(getAutoCompactThreshold(200000, 64000)).toBe(160000)
-  // 1M 模型 threshold=960K (~96%)
-  expect(getAutoCompactThreshold(1000000, 32000)).toBe(960000)
+it('#18 触发线六档逐值断言 (新公式)', () => {
+  expect(getAutoCompactThreshold(32_000)).toBe(27_200)
+  expect(getAutoCompactThreshold(64_000)).toBe(54_400)
+  expect(getAutoCompactThreshold(96_000)).toBe(81_600)
+  expect(getAutoCompactThreshold(128_000)).toBe(108_800)
+  expect(getAutoCompactThreshold(258_400)).toBe(219_640)
+  expect(getAutoCompactThreshold(1_000_000)).toBe(960_000)
+})
+
+it('getAutoCompactThreshold ignores maxOutputTokens (签名兼容, 新公式不依赖)', () => {
+  // 新公式只看窗口; maxOutputTokens 保留仅为调用方兼容
+  expect(getAutoCompactThreshold(200000, 64000)).toBe(getAutoCompactThreshold(200000, 8192))
+  expect(getAutoCompactThreshold(200000)).toBe(170000) // 200000 − min(40000, 30000)
 })
 
 // ─── clampTokenDetails tests ───

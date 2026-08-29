@@ -1310,6 +1310,7 @@ export async function* handleConversationRun(
             round,
             allocateExecMessageId: () => ++blobCounter,
             cursorDynamicTools: parsed.cursorDynamicTools,
+            contextTokenLimit,
           })
           if (ctx)
             taskLaunches.push(ctx)
@@ -1343,6 +1344,7 @@ export async function* handleConversationRun(
           supportsMcpAuth: parsed.supportsMcpAuth,
           cursorDynamicTools: parsed.cursorDynamicTools,
           projectDir: parsed.env.projectFolder ?? parsed.env.workspacePaths?.[0],
+          contextTokenLimit,
         })
         for await (const frame of toolFrames) {
           const completedToolCall = extractCompletedToolCall(frame)

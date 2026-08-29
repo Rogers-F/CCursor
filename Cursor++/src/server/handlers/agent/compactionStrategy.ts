@@ -76,6 +76,10 @@ export function formatMessageForSummary(message: LLMMessage): string {
                     // Anthropic 形态: 工具结果是 user 消息里的 content block
                     lines.push(formatToolResultForSummary(block.toolName ?? block.toolUseId, block.content));
                     break;
+                case 'image':
+                    // 图片不可文本化 — 官方以 [Image] 占位 (CC-013), 现状静默丢弃
+                    lines.push('[Image]');
+                    break;
             }
         }
     }

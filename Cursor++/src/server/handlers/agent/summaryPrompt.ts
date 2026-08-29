@@ -55,7 +55,9 @@ If there is a next step, include direct quotes from the most recent conversation
 showing exactly what task you were working on and where you left off. This should be verbatim to ensure
 there's no drift in task interpretation.
 
-Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response.</summarization_request>`;
+Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response.
+
+IMPORTANT NOTE ON TRUNCATED TOOL OUTPUT: Some tool outputs in the transcript above may be marked with [truncated] or [omitted] — they were shortened to fit this summary request. In your summary, you MUST still preserve their file paths, shell commands, agentIds, and any conclusions or error information they contain, because later work depends on them. The original full output can be recovered by re-running the tool, so mention in the relevant sections that re-running (e.g. re-reading a file or re-running the subagent) can restore the full content.</summarization_request>`;
 
 export function buildSummaryUserMessage(summarySourceText: string): string {
     return SUMMARY_USER_TEMPLATE.replace('{CONVERSATION}', summarySourceText);

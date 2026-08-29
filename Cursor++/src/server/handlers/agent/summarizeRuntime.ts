@@ -125,6 +125,15 @@ async function* handleSummarizeActionLocked(
     }
 
     if (compactionPlan.summarizeEntries.length === 0) {
+        // F2: mode==='disabled' 时 plan 同样返回空 summarizeEntries, 但语义是
+        // "压缩结构性不可行" (leading 过大/窗口过小), 不是"已经够紧凑" — 文案须区分
+        if (compactionPlan.mode === 'disabled') {
+            logger.warn({
+                conversationId: parsed.conversationId,
+                contextTokenLimit,
+                leadingTokens: compactionPlan.diagnostics.leadingTokens,
+            }, '[AUTOCOMPACT] summarizeAction skipped — compaction structurally infeasible for this window');
+        }
         logger.info({
             conversationId: parsed.conversationId,
             origin: 'client_summarize',
@@ -145,7 +154,9 @@ async function* handleSummarizeActionLocked(
             updatedAt: Date.now(),
         });
 
-        yield summaryCompleted(hookMessage ?? 'Conversation already compact enough.');
+        yield summaryCompleted(hookMessage ?? (compactionPlan.mode === 'disabled'
+            ? 'Compaction unavailable: system prompt plus reserves exceed this model\'s usable context window. Consider a larger-context model.'
+            : 'Conversation already compact enough.'));
         yield checkpoint(
             parsed.historyBlobIds,
             currentTokenDetails.usedTokens,

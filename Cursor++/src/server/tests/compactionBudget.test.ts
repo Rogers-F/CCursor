@@ -92,6 +92,14 @@ export function makeVariedReportText(chars: number): string {
   return lines.join('\n')
 }
 
+/** 解码 archive blob 的 summarizedMessages 为 blobId 列表 (双保险归档排除断言用) */
+function decodeArchivedBlobIds(artifacts: ReturnType<typeof createCompactionArtifacts>): string[] {
+  return artifacts.archiveBlobs.flatMap((archiveBlob) => {
+    const archiveMessage = fromBinary(ConversationSummaryArchiveSchema, Buffer.from(archiveBlob.blobData, 'base64'))
+    return archiveMessage.summarizedMessages.map(idBytes => Buffer.from(idBytes).toString('utf8'))
+  })
+}
+
 /** 生成指定 o200k token 量级的中文文本 (chars/4 低估 4x 场景; 比例收敛校准) */
 export function makeTokenSizedChineseText(tokens: number): string {
   let text = '汉字内容片段。'.repeat(Math.ceil(tokens / 2))
@@ -739,12 +747,18 @@ describe('#10/#24 小窗: clamp / B 模式 / 禁用', () => {
     ]
     const plan = planCompaction(entries, { contextTokenLimit: 32_000 })
     expect(plan.mode).toBe('b-mode')
-    // 全量摘要 (锚点除外) + 锚点单条尾窗
-    expect(plan.summarizeEntries.map(entry => entry.message.role)).toEqual(['assistant', 'tool'])
+    // 双保险 (§3.5, 验收修正 F1): 锚点既留在摘要源 (摘要器对齐任务) 又原文保留于尾窗
+    expect(plan.summarizeEntries.map(entry => entry.message.role)).toEqual(['user', 'assistant', 'tool'])
     expect(plan.keepTail.length).toBe(1)
     expect(plan.keepTail[0]!.message.role).toBe('user')
     expect(plan.keepTail[0]!.message.content).toContain('fix the build error')
     expect(plan.anchorBlobId).toBe(plan.keepTail[0]!.blobId)
+    expect(plan.summarizeEntries.some(entry => entry.blobId === plan.anchorBlobId)).toBe(true)
+    // archive 不因双保险重复归档锚点 (createCompactionArtifacts 按 anchorBlobId 排除)
+    const artifacts = createCompactionArtifacts({ plan, summaryText: 'b-mode summary', previousSummaryArchiveIds: [] })
+    const archivedBlobIds = decodeArchivedBlobIds(artifacts)
+    expect(archivedBlobIds).not.toContain(plan.anchorBlobId)
+    expect(artifacts.nextRootBlobIds).toContain(plan.anchorBlobId)
   })
 
   it('#24-2 leading 过大 (~28K on 32K 窗): 禁用自动压缩 (拒动为合格终态)', () => {

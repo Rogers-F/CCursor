@@ -6,11 +6,10 @@ import { heartbeat, checkpoint, kvMessage, summary, summaryCompleted, summarySta
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
 import { hydrateHistoryEntries, repairHistoryEntries } from './historyManager';
-import { createCompactionArtifacts, formatMessageForSummary, measureMessagesTokens, planCompaction } from './compactionStrategy';
+import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy';
 import { releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock';
 import { executePreCompactHook } from './hookRuntime';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
-import { SUMMARY_SYSTEM_PROMPT, buildSummaryUserMessage } from './summaryPrompt';
 import { logger } from '../../logger';
 
 export async function* handleSummarizeAction(
@@ -165,10 +164,8 @@ async function* handleSummarizeActionLocked(
         return;
     }
 
-    const summarySourceText = compactionPlan.summarizeEntries
-        .map(entry => formatMessageForSummary(entry.message))
-        .filter(text => text.length > 0)
-        .join('\n\n');
+    // 摘要源构造 (阶段 4): 总预算 min(0.6×窗口×4, 3.2e6) chars, 超限走 max-min 水位分配
+    const summarySourceText = buildSummarySource(compactionPlan.summarizeEntries, { contextTokenLimit });
 
     let summaryText = '';
     const llmStartTime = Date.now();
@@ -180,30 +177,25 @@ async function* handleSummarizeActionLocked(
         keepTail: compactionPlan.keepTail.length,
     }, '[SUMMARIZE] LLM summary starting');
 
+    // 三级兜底 (流式, 与 inline 路径同一实现 — 两路行为一致)
     let lastHeartbeatTime = Date.now();
-    try {
-        const llmStream = route.provider.stream({
-            model: route.model,
-            thinking: false,
-            messages: [
-                { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-                { role: 'user', content: buildSummaryUserMessage(summarySourceText) },
-            ],
-        });
-
-        for await (const event of llmStream) {
-            if (event.type === 'text_delta') {
-                summaryText += event.text;
-                yield summary(event.text);
-            }
-            // LLM 生成期间持续 yield heartbeat, 防止客户端 stall detector 误判
-            if (Date.now() - lastHeartbeatTime >= 4000) {
-                yield heartbeat();
-                lastHeartbeatTime = Date.now();
-            }
+    for await (const summaryEvent of streamSummaryWithFallback({
+        provider: route.provider,
+        model: route.model,
+        sourceText: summarySourceText,
+        contextTokenLimit,
+    })) {
+        if (summaryEvent.type === 'delta') {
+            summaryText += summaryEvent.text;
+            yield summary(summaryEvent.text);
         }
-    } catch (error) {
-        logger.warn({ error: (error as Error).message, durationMs: Date.now() - llmStartTime }, '[SUMMARIZE] LLM failed, falling back to local summary');
+        // LLM 生成期间持续 yield heartbeat, 防止客户端 stall detector 误判
+        if (Date.now() - lastHeartbeatTime >= 4000) {
+            yield heartbeat();
+            lastHeartbeatTime = Date.now();
+        }
+        if (summaryEvent.type === 'done')
+            summaryText = summaryEvent.text;
     }
 
     logger.info({
@@ -211,21 +203,6 @@ async function* handleSummarizeActionLocked(
         summaryLen: summaryText.length,
         durationMs: Date.now() - llmStartTime,
     }, '[SUMMARIZE] LLM summary done');
-
-    summaryText = summaryText.trim();
-    if (!summaryText) {
-        summaryText = summarySourceText
-            .split('\n')
-            .map(line => line.trim())
-            .filter(Boolean)
-            .slice(0, 12)
-            .map(line => `- ${line.replace(/^-\s*/, '')}`)
-            .join('\n')
-            .slice(0, 4000);
-    }
-    if (!summaryText) {
-        summaryText = '- Prior conversation compacted.';
-    }
 
     const artifacts = createCompactionArtifacts({
         plan: compactionPlan,

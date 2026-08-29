@@ -11,12 +11,11 @@ import { decodeBlob } from './blob'
 import { cacheBlob, getCachedBlob } from './blobStore'
 import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, measureMessagesTokens, planCompaction } from './compactionStrategy'
+import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy'
 import { getCompactionContentionCount, releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock'
 import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
-import { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } from './summaryPrompt'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
 import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
 import { restoreBlobMessageToLLMMessage } from './transcript'
@@ -621,47 +620,44 @@ async function* performInlineAutoSummarizeLocked(params: {
 
   yield summaryStarted()
 
-  const summarySourceText = compactionPlan.summarizeEntries
-    .map(entry => formatMessageForSummary(entry.message))
-    .filter(text => text.length > 0)
-    .join('\n\n')
+  // 摘要源构造 (阶段 4): 总预算 min(0.6×窗口×4, 3.2e6) chars, 超限走 max-min 水位分配
+  const summarySourceText = buildSummarySource(compactionPlan.summarizeEntries, { contextTokenLimit })
 
+  const llmStartTime = Date.now()
+  logger.info({
+    conversationId: parsed.conversationId,
+    sourceTextLen: summarySourceText.length,
+    summarizeEntries: compactionPlan.summarizeEntries.length,
+    keepTail: compactionPlan.keepTail.length,
+  }, '[SUMMARIZE] LLM summary starting')
+
+  // 三级兜底 (流式): ≤3 次重试 (源预算递减 + shorter-output 指令) → 确定性降级 → 占位文本;
+  // SUMMARY_HARD_CAP: 产出超 2×预留 → shorter-output 重试 → token 级裁剪
   let summaryText = ''
-  try {
-    const llmStream = route.provider.stream({
-      model: route.model,
-      thinking: false,
-      messages: [
-        { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-        { role: 'user', content: buildSummaryUserMessage(summarySourceText) },
-      ],
-    })
-
-    for await (const event of llmStream) {
-      if (event.type === 'text_delta') {
-        summaryText += event.text
-        yield summary(event.text)
-      }
+  let lastHeartbeatTime = Date.now()
+  for await (const summaryEvent of streamSummaryWithFallback({
+    provider: route.provider,
+    model: route.model,
+    sourceText: summarySourceText,
+    contextTokenLimit,
+  })) {
+    if (summaryEvent.type === 'delta') {
+      summaryText += summaryEvent.text
+      yield summary(summaryEvent.text)
     }
-  }
-  catch (error) {
-    logger.warn({ error: (error as Error).message }, '[AGENT] auto-summarize: LLM failed, using local fallback')
+    if (Date.now() - lastHeartbeatTime >= 4000) {
+      yield heartbeat()
+      lastHeartbeatTime = Date.now()
+    }
+    if (summaryEvent.type === 'done')
+      summaryText = summaryEvent.text
   }
 
-  summaryText = summaryText.trim()
-  if (!summaryText) {
-    summaryText = summarySourceText
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-      .slice(0, 12)
-      .map(line => `- ${line.replace(LEADING_DASH_RE, '')}`)
-      .join('\n')
-      .slice(0, 4000)
-  }
-  if (!summaryText) {
-    summaryText = '- Prior conversation compacted.'
-  }
+  logger.info({
+    conversationId: parsed.conversationId,
+    summaryLen: summaryText.length,
+    durationMs: Date.now() - llmStartTime,
+  }, '[SUMMARIZE] LLM summary done')
 
   const artifacts = createCompactionArtifacts({
     plan: compactionPlan,

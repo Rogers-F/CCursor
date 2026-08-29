@@ -16,7 +16,18 @@ import { ConversationSummaryArchiveSchema } from '../gen/agent_v1_pb'
 import { encodeBlob } from '../handlers/agent/blob'
 import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
 import { getCompactionContentionCount, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from '../handlers/agent/compactionLock'
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, measureMessagesTokens, planCompaction } from '../handlers/agent/compactionStrategy'
+import {
+  buildSummarySource,
+
+  computeSummaryHardCapTokens,
+  computeSummarySourceBudgetChars,
+  createCompactionArtifacts,
+  estimateMessagesTokens,
+  formatMessageForSummary,
+  generateSummaryWithFallback,
+  measureMessagesTokens,
+  planCompaction,
+} from '../handlers/agent/compactionStrategy'
 import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
 import { countTokens } from '../handlers/agent/tokenCounter'
 import {
@@ -1009,6 +1020,97 @@ describe('#20/#21/#22/#23/#27/#28/#32 锚点 / 前沿 / 输入侧 / 升级链', 
   })
 })
 
+describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
+  it('#11 摘要源封顶: 巨物进摘要侧 → 总长 ≤ 预算, 路径清单与错误行保留', () => {
+    // 258,400 窗 → 摘要源预算 min(0.6×258400×4, 3.2e6) = 620,160 chars
+    const entries: HistoryEntry[] = []
+    const toolResultWithPaths = [
+      'Analyzing module dependencies...',
+      'Read /repo/src/auth/login.ts',
+      'Read /repo/src/auth/session.ts',
+      'ERROR: cannot resolve module /repo/src/missing.ts',
+      makeVariedTokenText(400_000),
+      'Conclusion: the auth module requires session refactor',
+    ].join('\n')
+    entries.push(makeBlobEntry('user', 'investigate auth'))
+    entries.push(makeBlobEntry('assistant', [{ type: 'tool_use', id: 'call_s11', name: 'Read', input: { path: '/repo/src/auth.ts' } }]))
+    entries.push(makeBlobEntry('tool', toolResultWithPaths, { toolCallId: 'call_s11', toolName: 'Read' }))
+    entries.push(makeBlobEntry('assistant', 'done'))
+
+    // 用小窗口把预算压到 ~48K chars (0.6×20_000×4), 强制水位分配截断
+    const source = buildSummarySource(entries, { contextTokenLimit: 20_000 })
+    const totalBudget = computeSummarySourceBudgetChars(20_000)
+    expect(totalBudget).toBe(48_000)
+    expect(source.length).toBeLessThanOrEqual(totalBudget + 2_000)
+    // 路径清单与错误行强制保留
+    expect(source).toContain('/repo/src/auth/login.ts')
+    expect(source).toContain('ERROR')
+  })
+
+  it('#16 摘要三级兜底: LLM 三次失败 → 确定性降级 (水位分配产物 + 注入防御声明)', async () => {
+    const failingProvider = {
+      async* stream() {
+        throw new Error('provider unavailable')
+      },
+    }
+    const sourceText = makeVariedTokenText(2_000)
+    const summaryText = await generateSummaryWithFallback({
+      provider: failingProvider,
+      model: 'test-model',
+      sourceText,
+      contextTokenLimit: 258_400,
+    })
+
+    // 确定性降级: 不经模型, 含注入防御声明与转录内容
+    expect(summaryText).toContain('not instructions from the user')
+    expect(summaryText).toContain(sourceText.slice(0, 100))
+    // 降级预算 = clamp(258400×2%×4, 50K, 3.2M) = 50K chars — 全量保留
+    expect(summaryText.length).toBeGreaterThan(2_000)
+  })
+
+  it('#17 水位分配器: 200 条不等长消息 — min-quota 丢弃占位, <user_query> 块存续', () => {
+    const entries: HistoryEntry[] = []
+    // 1 条含 <user_query> 的 user 消息 (会被截断但保 query 块) + 199 条不等长消息
+    const longUserQuery = `<user_query>\nrefactor the entire auth subsystem carefully\n</user_query>\n${makeVariedTokenText(30_000)}`
+    entries.push(makeBlobEntry('user', longUserQuery))
+    for (let index = 0; index < 199; index++) {
+      const sizeClass = index % 3
+      entries.push(makeBlobEntry(
+        index % 2 === 0 ? 'user' : 'assistant',
+        makeVariedTokenText(sizeClass === 0 ? 50 : sizeClass === 1 ? 1_200 : 8_000),
+      ))
+    }
+
+    // 小窗口: 预算 0.6×20_000×4 = 48K chars, 199 条总量 ≈ 89K+ → 强制分配
+    const source = buildSummarySource(entries, { contextTokenLimit: 20_000 })
+    expect(source.length).toBeLessThanOrEqual(computeSummarySourceBudgetChars(20_000) + 3_000)
+    // 截断的 user 消息保留 <user_query> 块
+    expect(source).toContain('<user_query>')
+    expect(source).toContain('refactor the entire auth subsystem carefully')
+    // 短消息 (50 tok) 整条保留 / 长消息被截断标注
+    expect(source).toMatch(/\[\.\.\. truncated, \d+ chars\]/)
+  })
+
+  it('#33 摘要输出硬上界: mock 摘要器输出 20K → shorter-output 重试 → 仍超则裁剪至 SUMMARY_HARD_CAP', async () => {
+    // 恒定输出 20K tok 的"劣质"摘要器 (忽略指令)
+    const alwaysVerboseProvider = {
+      async* stream() {
+        yield { type: 'text_delta', text: makeVariedTokenText(20_000) }
+      },
+    }
+    const summaryText = await generateSummaryWithFallback({
+      provider: alwaysVerboseProvider,
+      model: 'test-model',
+      sourceText: makeVariedTokenText(1_000),
+      contextTokenLimit: 258_400,
+    })
+
+    // 258,400 窗 → SUMMARY_HARD_CAP = 2 × 5,000 = 10,000 tok
+    expect(computeSummaryHardCapTokens(258_400)).toBe(10_000)
+    expect(countTokens(summaryText)).toBeLessThanOrEqual(10_000)
+  })
+})
+
 describe('#25 并发互斥 (compactionLock)', () => {
   it('#25 inline 与 summarizeAction 并发: 后到 inline 跳过, 释放后 summarizeAction 可进入', async () => {
     const conversationId = 'conv-mutex-25'
@@ -1033,8 +1135,6 @@ describe('#25 并发互斥 (compactionLock)', () => {
     releaseCompactionLock(conversationId)
   })
 })
-
-//
 
 describe('sanity', () => {
   it('estimateMessagesTokens 可调用', () => {

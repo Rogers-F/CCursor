@@ -54,25 +54,37 @@ export function computeContextUsagePercent(usedTokens: number, maxTokens: number
 }
 
 /**
- * 自动压缩触发判定 — 绝对 buffer 模式
- *
- * 参考 Claude Code (buffer=13K, outputReserve=20K) 但为 Cursor IDE 场景加大预留:
- *
- * Cursor Agent 每轮有 IDE 专属固定开销——system prompt + preamble (~15K),
- * 注册工具 schema (~10K), rules/skills/MCP instructions (~5K),
- * exec 通道封装 + blob 元数据开销。比 CLI 环境多 ~20-30K。
- *
- *   effectiveWindow = maxTokens - outputReserve(20K)
- *   threshold = effectiveWindow - bufferTokens(20K)
- *
- * 以 200K 模型 80% 触发为基准测算:
- *   128K 模型: threshold=88K  → ~69%, 留 40K 余量
- *   200K 模型: threshold=160K → ~80%, 留 40K 余量 ← 基准
- *   1M 模型:  threshold=960K → 96%, 留 40K 余量
- * 40K ≈ 2 轮 Agent tool 调用余量 (system 15K + tool result 15K + output 8K)
+ * 旧公式常数 (第一阶段绝对 buffer 模式, 已被第二阶段新公式取代; 保留作历史参照)
  */
 const AUTOCOMPACT_BUFFER_TOKENS = 20_000
 const MAX_OUTPUT_RESERVE = 20_000
+void AUTOCOMPACT_BUFFER_TOKENS
+void MAX_OUTPUT_RESERVE
+
+/**
+ * 错误驱动压缩重试: provider 错误分类白名单 (设计文档 §7#9)。
+ *
+ * 只识别明确的 context-length / input-token-limit 类错误文案与错误码;
+ * 非白名单错误走现状路径, 防止误把普通 provider 故障当成窗口压力。
+ */
+const CONTEXT_LENGTH_ERROR_PATTERNS: RegExp[] = [
+    /context_length_exceeded/i,
+    /maximum context length/i,
+    /context length exceeded/i,
+    /prompt is too long/i,
+    /input token count exceeds/i,
+    /too many input tokens/i,
+    /input.*tokens?.*exceeds.*maximum/i,
+    /context window.*exceeded/i,
+    /request too large.*tokens/i,
+]
+
+export function isContextLengthLimitError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    if (!message)
+        return false
+    return CONTEXT_LENGTH_ERROR_PATTERNS.some(pattern => pattern.test(message))
+}
 
 /**
  * 净增长门槛: 距上次"有效"压缩基线的净增长须达到该值才允许再次自动压缩。
@@ -97,9 +109,17 @@ export function computeAutoCompactTriggerReserveTokens(maxTokens: number): numbe
 }
 
 export function getAutoCompactThreshold(maxTokens: number, maxOutputTokens = 8192): number {
-    const outputReserve = Math.min(maxOutputTokens, MAX_OUTPUT_RESERVE)
-    const effective = maxTokens - outputReserve
-    return effective - AUTOCOMPACT_BUFFER_TOKENS
+    // 第二阶段新公式 (设计文档 §5 参数表, 审计三修正):
+    //   threshold = 窗口 − min(40K, 15% × 窗口)
+    // 逐档值: 32K→27,200 / 64K→54,400 / 96K→81,600 / 128K→108,800 /
+    //         258.4K→219,640 / 1M→960,000
+    // maxOutputTokens 保留在签名中仅为兼容既有调用方, 不再参与计算
+    // (旧双轨 min(max−40K, 0.85max) 在 max<266K 时恒由绝对轨主导, 32K 取到
+    //  负值/64K 触发线 24K 逼近地板形成死带 — 详见设计文档 §5 触发公式行)
+    void maxOutputTokens
+    if (maxTokens <= 0)
+        return 0
+    return maxTokens - computeAutoCompactTriggerReserveTokens(maxTokens)
 }
 
 export function shouldTriggerCompaction(usedTokens: number, maxTokens: number, thresholdPercent?: number, maxOutputTokens = 8192): boolean {

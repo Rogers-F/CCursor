@@ -22,7 +22,8 @@ import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
-import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
+import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
+import { CONTEXT_LENGTH_RETRY_MAX } from './constants'
 import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
@@ -525,6 +526,8 @@ async function* performInlineAutoSummarize(params: {
   newSummaryArchiveIds: string[]
   newUsedTokens: number
   newMessages: LLMMessage[]
+  /** 本轮规划实际采用的基准预算 (错误驱动重试的 budget/2^retry 被除数) */
+  baseBudgetTokens: number
 } | null> {
   const { parsed } = params
 
@@ -559,6 +562,7 @@ async function* performInlineAutoSummarizeLocked(params: {
   newSummaryArchiveIds: string[]
   newUsedTokens: number
   newMessages: LLMMessage[]
+  baseBudgetTokens: number
 } | null> {
   const { parsed, allBlobIds, summaryArchiveIds, usedTokensEstimate, contextTokenLimit, route } = params
 
@@ -757,6 +761,7 @@ async function* performInlineAutoSummarizeLocked(params: {
     newSummaryArchiveIds: artifacts.nextSummaryArchiveIds,
     newUsedTokens: compactedTokenDetails.usedTokens,
     newMessages: repairedNewMessages,
+    baseBudgetTokens: compactionPlan.diagnostics.budgetTokens,
   }
 }
 
@@ -955,6 +960,10 @@ export async function* handleConversationRun(
   const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
   // 上次"有效"压缩后的估算基线; 净增长门槛的参照点 (0 = 本 run 尚未压缩过)
   let lastCompactionBaseline = 0
+  // 错误驱动压缩重试计数 (≤3 轮硬封顶) 与首次压缩基准预算 (budget/2^retry 的被除数)
+  let contextLengthRetryCount = 0
+  let baseKeepTailBudget = 0
+  let firstCompactionAt = 0
   const syntheticUserMessageId = parsed.isBackgroundTaskCompletion
     ? `background-completion-${Date.now()}`
     : parsed.rawUserMessage?.messageId && typeof parsed.rawUserMessage.messageId === 'string'
@@ -1312,6 +1321,49 @@ export async function* handleConversationRun(
         return
       }
 
+      // 错误驱动压缩重试 (设计文档 §4 运行时层, 官方 CC-001/017):
+      // provider 报 context-length 类错误 → aggressive 压缩 (预算 /2^retry)
+      // → 重发本轮请求, ≤3 轮硬封顶; 非白名单错误走现状路径。
+      if (autoCompactEnabled && isContextLengthLimitError(e) && contextLengthRetryCount < CONTEXT_LENGTH_RETRY_MAX) {
+        contextLengthRetryCount += 1
+        // aggressive 预算: 基准预算 / 2^retry (未压缩过时按 targetFloor 估计基准)
+        const effectiveBaseBudget = baseKeepTailBudget > 0
+          ? baseKeepTailBudget
+          : Math.floor(0.25 * contextTokenLimit)
+        const aggressiveBudget = Math.max(1, Math.floor(effectiveBaseBudget / 2 ** contextLengthRetryCount))
+        logger.warn({
+          conversationId: parsed.conversationId,
+          round,
+          retry: contextLengthRetryCount,
+          maxRetries: CONTEXT_LENGTH_RETRY_MAX,
+          aggressiveBudget,
+          error: (e as Error).message,
+        }, '[AUTOCOMPACT] context-length error — retrying with aggressive compaction')
+        const retryCompactionResult = yield* performInlineAutoSummarize({
+          parsed,
+          allBlobIds: [...parsed.historyBlobIds, ...blobIds],
+          summaryArchiveIds: currentSummaryArchiveIds,
+          usedTokensEstimate,
+          contextTokenLimit,
+          messages,
+          route,
+          readPaths: [...readContext.readPaths],
+          budgetOverride: aggressiveBudget,
+        })
+        if (retryCompactionResult) {
+          messages = retryCompactionResult.newMessages
+          parsed.historyBlobIds = retryCompactionResult.newBlobIds
+          currentSummaryArchiveIds = retryCompactionResult.newSummaryArchiveIds
+          usedTokensEstimate = retryCompactionResult.newUsedTokens
+          blobIds = []
+          blobCounter = 0
+          nextBlobbedMessageIndex = messages.length
+          lastCompactionBaseline = usedTokensEstimate
+          round-- // 重发本轮请求: for-loop 递增后回到同一 round
+          continue
+        }
+      }
+
       // 关键: 不再往对话流 yield textDelta('[BYOK Error] ...') —— 那会让错误文本
       // 伪装成 assistant 的"正常回复", 同时被写进 roundAssistantBlocks 污染历史,
       // 下一轮 LLM 会看到自己刚刚回复了 [BYOK Error] 导致状态错乱。
@@ -1565,6 +1617,20 @@ export async function* handleConversationRun(
           blobIds = []
           blobCounter = 0
           nextBlobbedMessageIndex = messages.length
+
+          // 首次压缩时间戳观测 (压缩间隔 p50/p95 的输入, 事故签名 4-5 分钟/次)
+          if (firstCompactionAt === 0) {
+            firstCompactionAt = Date.now()
+          }
+          else {
+            logger.info({
+              conversationId: parsed.conversationId,
+              sinceFirstCompactionMs: Date.now() - firstCompactionAt,
+            }, '[AUTOCOMPACT] compaction interval sample')
+          }
+          // 记录基准预算 (错误驱动重试的 budget/2^retry 被除数)
+          if (compactionResult.baseBudgetTokens > 0)
+            baseKeepTailBudget = compactionResult.baseBudgetTokens
 
           // 压缩后仍超线 = 无效压缩 (keepTail 巨物压不动), 计入熔断而非清零,
           // 否则"每轮都成功压缩却永远降不到线下"的循环没有任何刹车

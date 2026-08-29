@@ -28,6 +28,7 @@ import {
   measureMessagesTokens,
   planCompaction,
 } from '../handlers/agent/compactionStrategy'
+import { CONTEXT_LENGTH_RETRY_MAX } from '../handlers/agent/constants'
 import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
 import { countTokens } from '../handlers/agent/tokenCounter'
 import {
@@ -35,6 +36,7 @@ import {
   resolveTaskEntryCapTokens,
   TASK_ENTRY_CAP_MAX_TOKENS,
 } from '../handlers/agent/toolkit/results/taskToolResults'
+import { getAutoCompactThreshold, isContextLengthLimitError } from '../handlers/agent/usage'
 
 // ─── helpers ───
 
@@ -1133,6 +1135,53 @@ describe('#25 并发互斥 (compactionLock)', () => {
     // 释放后可重新获取
     expect(tryAcquireCompactionLock(conversationId)).toBe(true)
     releaseCompactionLock(conversationId)
+  })
+})
+
+describe('#15/#18 错误驱动重试与触发公式 (阶段 5)', () => {
+  it('#15 context-length 错误分类: 白名单文案命中, 非 window 类错误不命中', async () => {
+    expect(isContextLengthLimitError(new Error('This model\'s maximum context length is 128000 tokens. However, you requested 150000 tokens.'))).toBe(true)
+    expect(isContextLengthLimitError(new Error('Error code: 400 - prompt is too long: 210000 tokens > 200000 maximum'))).toBe(true)
+    expect(isContextLengthLimitError(new Error('input token count exceeds the maximum number of input tokens'))).toBe(true)
+    expect(isContextLengthLimitError(new Error('context_length_exceeded'))).toBe(true)
+    // 非白名单: 普通 provider 故障
+    expect(isContextLengthLimitError(new Error('rate limit exceeded'))).toBe(false)
+    expect(isContextLengthLimitError(new Error('connection timeout'))).toBe(false)
+    expect(isContextLengthLimitError(new Error('invalid api key'))).toBe(false)
+    expect(isContextLengthLimitError(null)).toBe(false)
+  })
+
+  it('#15 错误驱动 aggressive 压缩: budget/2^retry 逐轮减半, ≤3 轮', () => {
+    // 模拟 provider 前两轮报 context-length 错误 → 第三轮成功的 ladder:
+    // planCompaction 以 budgetOverride (基准/2^retry) 规划, 摘要侧逐轮扩大
+    const baseBudget = 59_580 // 258,400 窗小 leading 下的典型基准
+    const aggressiveBudgets = [1, 2, 3].map(retry => Math.max(1, Math.floor(baseBudget / 2 ** retry)))
+    expect(aggressiveBudgets[0]).toBe(29_790)
+    expect(aggressiveBudgets[1]).toBe(14_895)
+    expect(aggressiveBudgets[2]).toBe(7_447)
+    // 重试上限 3 (constants)
+    expect(CONTEXT_LENGTH_RETRY_MAX).toBe(3)
+    // aggressive 档下 keepTail 单调不增 (预算减半 → 尾窗更小)
+    const entries: HistoryEntry[] = [...makeLeadingEntries(), makeBlobEntry('user', makeVariedTokenText(500))]
+    for (let index = 0; index < 40; index++)
+      entries.push(...makeToolGroup({ callId: `call_c15_${index}`, toolName: 'Read', input: { path: `p${index}.ts` }, resultTokens: 3_000 }))
+    const planBase = planCompaction(entries, { contextTokenLimit: 258_400 })
+    const planAggressive = planCompaction(entries, { contextTokenLimit: 258_400, budgetOverride: aggressiveBudgets[1] })
+    expect(planAggressive.diagnostics.budgetTokens).toBe(aggressiveBudgets[1])
+    expect(planAggressive.diagnostics.keepTailActualTokens).toBeLessThanOrEqual(planBase.diagnostics.keepTailActualTokens)
+    expect(planAggressive.summarizeEntries.length).toBeGreaterThanOrEqual(planBase.summarizeEntries.length)
+  })
+
+  it('#18 触发线公式: 六档逐值断言 (窗口 − min(40K, 15%×窗口))', () => {
+    expect(getAutoCompactThreshold(32_000)).toBe(27_200)
+    expect(getAutoCompactThreshold(64_000)).toBe(54_400)
+    expect(getAutoCompactThreshold(96_000)).toBe(81_600)
+    expect(getAutoCompactThreshold(128_000)).toBe(108_800)
+    expect(getAutoCompactThreshold(258_400)).toBe(219_640)
+    expect(getAutoCompactThreshold(1_000_000)).toBe(960_000)
+    // 32K/64K 死带消除: 旧公式分别取 −8K / 24K
+    expect(getAutoCompactThreshold(32_000)).toBeGreaterThan(0)
+    expect(getAutoCompactThreshold(64_000)).toBeGreaterThan(50_000)
   })
 })
 

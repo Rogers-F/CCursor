@@ -47,6 +47,7 @@ export function* flushMessageBlobs(
       toolCallId: msg.toolCallId,
       toolName: msg.toolName,
       isError: msg.isError,
+      providerOptions: msg.providerOptions,
     }, blobIds)
     nextIndex = i + 1
   }
@@ -155,12 +156,42 @@ export function mergePrependUserMessages(
   }
 }
 
+/**
+ * 摘要 blob 判定 — 双保险 (设计文档 §6 Q6):
+ *   1. providerOptions.cursor.isSummary 语义标记 (修复后透传, 语义根治);
+ *   2. 内容前缀 fallback: assistant 且以 `Previous conversation summary:` 开头
+ *      (本插件格式) 或官方 `[Previous conversation summary]: ` 格式 ——
+ *      对修复上线前的存量摘要 blob 立即生效 (标记已丢, 只剩前缀)。
+ */
+const SUMMARY_CONTENT_PREFIXES = [
+  'Previous conversation summary:',
+  '[Previous conversation summary]:',
+] as const
+
+function extractLeadingTextFromContent(content: unknown): string {
+  if (typeof content === 'string')
+    return content
+  if (Array.isArray(content)) {
+    const firstTextBlock = content.find(
+      (block): block is Record<string, unknown> => isRecord(block) && block.type === 'text',
+    )
+    return typeof firstTextBlock?.text === 'string' ? firstTextBlock.text : ''
+  }
+  return ''
+}
+
 export function isSummaryBlobMessage(raw: Record<string, unknown>): boolean {
   const providerOptions = raw.providerOptions
-  if (!isRecord(providerOptions))
-    return false
-  const cursor = providerOptions.cursor
-  return isRecord(cursor) && cursor.isSummary === true
+  if (isRecord(providerOptions)) {
+    const cursor = providerOptions.cursor
+    if (isRecord(cursor) && cursor.isSummary === true)
+      return true
+  }
+  if (raw.role === 'assistant') {
+    const text = extractLeadingTextFromContent(raw.content).trimStart()
+    return SUMMARY_CONTENT_PREFIXES.some(prefix => text.startsWith(prefix))
+  }
+  return false
 }
 
 export function hydrateHistoryEntries(blobIds: string[]): HistoryEntry[] {
@@ -193,6 +224,7 @@ export function materializeHistoryEntries(messages: LLMMessage[]): HistoryEntry[
       toolCallId: message.toolCallId,
       toolName: message.toolName,
       isError: message.isError,
+      providerOptions: message.providerOptions,
     })
     const blob = encodeBlob(normalized)
     cacheBlob(blob.blobId, blob.blobData)

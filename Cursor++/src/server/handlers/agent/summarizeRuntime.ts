@@ -6,7 +6,8 @@ import { heartbeat, checkpoint, kvMessage, summary, summaryCompleted, summarySta
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
 import { hydrateHistoryEntries, repairHistoryEntries } from './historyManager';
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from './compactionStrategy';
+import { createCompactionArtifacts, formatMessageForSummary, measureMessagesTokens, planCompaction } from './compactionStrategy';
+import { releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock';
 import { executePreCompactHook } from './hookRuntime';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
 import { SUMMARY_SYSTEM_PROMPT, buildSummaryUserMessage } from './summaryPrompt';
@@ -17,13 +18,31 @@ export async function* handleSummarizeAction(
     session: AgentSession | null,
 ): AsyncIterable<AgentServerMessage> {
     const route = resolveProviderRuntime(parsed.modelId);
+    // 并发互斥 (设计文档 §7#7): 等待 inline 压缩释放后再重新评估是否仍需压缩
+    await waitForCompactionLockRelease(parsed.conversationId);
+    if (!tryAcquireCompactionLock(parsed.conversationId))
+        logger.warn({ conversationId: parsed.conversationId }, '[AUTOCOMPACT] summarizeAction lock contention — proceeding after wait');
+    try {
+        yield* handleSummarizeActionLocked(parsed, session, route);
+    }
+    finally {
+        releaseCompactionLock(parsed.conversationId);
+    }
+}
+
+async function* handleSummarizeActionLocked(
+    parsed: ParsedRunRequest,
+    session: AgentSession | null,
+    route: ReturnType<typeof resolveProviderRuntime>,
+): AsyncIterable<AgentServerMessage> {
     const hydratedHistoryEntries = hydrateHistoryEntries(parsed.historyBlobIds);
     const missingHistoryBlobs = Math.max(0, parsed.historyBlobIds.length - hydratedHistoryEntries.length);
     const historyEntries = repairHistoryEntries(hydratedHistoryEntries);
-    const compactionPlan = planCompaction(historyEntries);
+    const contextTokenLimit = parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit;
+    const compactionPlan = planCompaction(historyEntries, { contextTokenLimit });
     const currentTokenDetails = clampTokenDetails(
-        parsed.historyTokenDetails?.usedTokens ?? estimateMessagesTokens(historyEntries.map(entry => entry.message)),
-        parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit,
+        parsed.historyTokenDetails?.usedTokens ?? measureMessagesTokens(historyEntries.map(entry => entry.message)),
+        contextTokenLimit,
     );
     const contextUsagePercent = computeContextUsagePercent(currentTokenDetails.usedTokens, currentTokenDetails.maxTokens);
     const generationId = randomUUID();
@@ -220,7 +239,8 @@ export async function* handleSummarizeAction(
     }
 
     const compactedUsedTokens = clampTokenDetails(
-        estimateMessagesTokens([
+        // o200k 实测重置 (与 inline 路径同口径, 两路行为一致由单一实现保证)
+        measureMessagesTokens([
             ...compactionPlan.leading.map(entry => entry.message),
             { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
             ...compactionPlan.keepTail.map(entry => entry.message),

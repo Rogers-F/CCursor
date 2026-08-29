@@ -11,7 +11,8 @@ import { decodeBlob } from './blob'
 import { cacheBlob, getCachedBlob } from './blobStore'
 import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from './compactionStrategy'
+import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, measureMessagesTokens, planCompaction } from './compactionStrategy'
+import { getCompactionContentionCount, releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock'
 import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
@@ -519,6 +520,41 @@ async function* performInlineAutoSummarize(params: {
   messages: LLMMessage[]
   route: ReturnType<typeof resolveProviderRuntime>
   readPaths: string[]
+  budgetOverride?: number
+}): AsyncGenerator<AgentServerMessage, {
+  newBlobIds: string[]
+  newSummaryArchiveIds: string[]
+  newUsedTokens: number
+  newMessages: LLMMessage[]
+} | null> {
+  const { parsed } = params
+
+  // 并发互斥 (设计文档 §7#7): inline 触发时锁被占 → 本轮跳过并计数, 下轮重试
+  if (!tryAcquireCompactionLock(parsed.conversationId)) {
+    logger.warn({
+      conversationId: parsed.conversationId,
+      contentionCount: getCompactionContentionCount(parsed.conversationId),
+    }, '[AUTOCOMPACT] compaction lock held (manual summarize in progress?) — skipping inline compaction this round')
+    return null
+  }
+  try {
+    return yield* performInlineAutoSummarizeLocked(params)
+  }
+  finally {
+    releaseCompactionLock(parsed.conversationId)
+  }
+}
+
+async function* performInlineAutoSummarizeLocked(params: {
+  parsed: ParsedRunRequest
+  allBlobIds: string[]
+  summaryArchiveIds: string[]
+  usedTokensEstimate: number
+  contextTokenLimit: number
+  messages: LLMMessage[]
+  route: ReturnType<typeof resolveProviderRuntime>
+  readPaths: string[]
+  budgetOverride?: number
 }): AsyncGenerator<AgentServerMessage, {
   newBlobIds: string[]
   newSummaryArchiveIds: string[]
@@ -531,29 +567,56 @@ async function* performInlineAutoSummarize(params: {
   if (historyEntries.length === 0)
     return null
 
-  const compactionPlan = planCompaction(historyEntries)
+  const compactionPlan = planCompaction(historyEntries, {
+    contextTokenLimit,
+    budgetOverride: params.budgetOverride,
+  })
+
+  // 小窗结构性不可行终态: 停用自动压缩并告警 (拒动为合格终态, 设计文档 #10)
+  if (compactionPlan.mode === 'disabled') {
+    logger.error({
+      conversationId: parsed.conversationId,
+      contextTokenLimit,
+      diagnostics: compactionPlan.diagnostics,
+    }, '[AUTOCOMPACT] planCompaction disabled — skipping compaction (see guidance above)')
+    return null
+  }
+
   if (compactionPlan.summarizeEntries.length === 0) {
     logger.info({ conversationId: parsed.conversationId }, '[AGENT] auto-summarize: nothing to compact')
     return null
   }
 
-  // keepTail 构成观测: 巨型 tool_result (大文件读取 / Task 报告) 是否钉在尾窗,
-  // 直接决定压缩后基线能否降到触发线以下
+  // keepTail 构成观测: 占位命中数 / 实占 token / 前沿超额 / 违约与升级链事件
+  const planDiagnostics = compactionPlan.diagnostics
   const keepTailEntries = compactionPlan.keepTail.map(entry => ({
     role: entry.message.role,
     toolName: entry.message.toolName,
-    tokens: estimateMessagesTokens([entry.message]),
+    isPlaceholder: typeof entry.message.content === 'string'
+      ? entry.message.content.includes('[tool output elided during context compaction')
+      : false,
+    tokens: measureMessagesTokens([entry.message]),
   }))
   logger.info({
     conversationId: parsed.conversationId,
+    compactionStartedAt: new Date().toISOString(),
     totalEntries: historyEntries.length,
     summarizeCount: compactionPlan.summarizeEntries.length,
     keepTailCount: compactionPlan.keepTail.length,
     leadingCount: compactionPlan.leading.length,
     keepTailTokens: keepTailEntries,
-    maxKeepTailEntryTokens: keepTailEntries.reduce((m, e) => Math.max(m, e.tokens), 0),
+    placeholderHits: planDiagnostics.placeholderCount,
+    inputElidedCount: planDiagnostics.inputElidedCount,
+    anchorInserted: planDiagnostics.anchorInserted,
+    escalationLevel: planDiagnostics.escalationLevel,
+    floorViolation: planDiagnostics.floorViolation,
+    frontierExcessTokens: planDiagnostics.frontierExcessTokens,
+    firstConsumptionLossCount: planDiagnostics.firstConsumptionLossCount,
+    budgetTokens: planDiagnostics.budgetTokens,
+    largeEntryLineTokens: planDiagnostics.largeEntryLineTokens,
     usedTokensEstimate,
     contextTokenLimit,
+    aggressiveRetry: params.budgetOverride !== undefined,
   }, '[AGENT] auto-summarize: starting inline compaction')
 
   yield summaryStarted()
@@ -611,8 +674,9 @@ async function* performInlineAutoSummarize(params: {
     yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw)
   }
 
+  // o200k 实测重置 (替代 chars/4): 重置精度直接决定 provider usage 反弹差大小
   const compactedTokenDetails = clampTokenDetails(
-    estimateMessagesTokens([
+    measureMessagesTokens([
       ...compactionPlan.leading.map(entry => entry.message),
       { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
       ...compactionPlan.keepTail.map(entry => entry.message),

@@ -23,13 +23,61 @@ import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline }
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
 import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
-import { CONTEXT_LENGTH_RETRY_MAX } from './constants'
+import { AGENT_HEARTBEAT_INTERVAL_MS, CONTEXT_LENGTH_RETRY_MAX } from './constants'
 import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory } from '../llm/transformMessages'
 
 const LEADING_DASH_RE = /^-\s*/
+
+/**
+ * SSE 保活哨兵 (2026-08-29 二次实弹修正): 摘要流消费循环的心跳必须定时驱动。
+ * 思考模型摘要期零事件 → 事件驱动心跳饿死 → SSE 静默 ~93s → Cursor 客户端
+ * stall 判死弃 run 重发, 在飞行摘要作废且并发 run 续涨上下文。
+ */
+export const HEARTBEAT_TICK: unique symbol = Symbol('summary-heartbeat-tick')
+
+/**
+ * 包装摘要事件流: 源流静默超过 AGENT_HEARTBEAT_INTERVAL_MS 时产出
+ * HEARTBEAT_TICK, 消费方转发为 SSE heartbeat, 与源流事件无关地维持连接活性。
+ */
+export async function* pumpWithTimedHeartbeats<TEvent>(
+  sourceStream: AsyncIterable<TEvent>,
+  heartbeatIntervalMs: number = AGENT_HEARTBEAT_INTERVAL_MS,
+): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, void> {
+  const sourceIterator = sourceStream[Symbol.asyncIterator]()
+  let pendingStep: Promise<IteratorResult<TEvent>> | null = null
+  try {
+    while (true) {
+      // 复用未决的 next(): 心跳分支返回后源 promise 仍在飞行, 不可重复调用 next()
+      pendingStep = pendingStep ?? sourceIterator.next()
+      let timerId: ReturnType<typeof setTimeout> | undefined
+      const tickPromise = new Promise<typeof HEARTBEAT_TICK>((resolveTick) => {
+        timerId = setTimeout(() => resolveTick(HEARTBEAT_TICK), heartbeatIntervalMs)
+      })
+      let raceOutcome: IteratorResult<TEvent> | typeof HEARTBEAT_TICK
+      try {
+        raceOutcome = await Promise.race([pendingStep, tickPromise])
+      }
+      finally {
+        clearTimeout(timerId)
+      }
+      if (raceOutcome === HEARTBEAT_TICK) {
+        yield HEARTBEAT_TICK
+        continue
+      }
+      pendingStep = null
+      if (raceOutcome.done)
+        return
+      yield raceOutcome.value
+    }
+  }
+  finally {
+    // 消费方提前退出 (run 取消): 不 await return() — 源可能悬在内部 await
+    void Promise.resolve().then(() => sourceIterator.return?.()).catch(() => {})
+  }
+}
 
 const EDIT_TOOL_NAMES = new Set(['ApplyPatch', 'Edit', 'Write', 'EditNotebook'])
 
@@ -639,22 +687,24 @@ async function* performInlineAutoSummarizeLocked(params: {
   }, '[SUMMARIZE] LLM summary starting')
 
   // 三级兜底 (流式): ≤3 次重试 (源预算递减 + shorter-output 指令) → 确定性降级 → 占位文本;
-  // SUMMARY_HARD_CAP: 产出超 2×预留 → shorter-output 重试 → token 级裁剪
+  // SUMMARY_HARD_CAP: 产出超 2×预留 → shorter-output 重试 → token 级裁剪。
+  // 心跳必须定时驱动 (2026-08-29 二次实弹): 思考模型摘要期零事件, 事件驱动心跳
+  // 会饿死 → SSE 静默 ~93s → 客户端 stall 判死弃 run 重发 → 摘要成果作废 +
+  // 并发 run 续涨上下文 → 背靠背二次压缩 (三次实测 92.5/92.7/95.0s 一致实锤)。
   let summaryText = ''
-  let lastHeartbeatTime = Date.now()
-  for await (const summaryEvent of streamSummaryWithFallback({
+  for await (const summaryEvent of pumpWithTimedHeartbeats(streamSummaryWithFallback({
     provider: route.provider,
     model: route.model,
     sourceText: summarySourceText,
     contextTokenLimit,
-  })) {
+  }))) {
+    if (summaryEvent === HEARTBEAT_TICK) {
+      yield heartbeat()
+      continue
+    }
     if (summaryEvent.type === 'delta') {
       summaryText += summaryEvent.text
       yield summary(summaryEvent.text)
-    }
-    if (Date.now() - lastHeartbeatTime >= 4000) {
-      yield heartbeat()
-      lastHeartbeatTime = Date.now()
     }
     if (summaryEvent.type === 'done')
       summaryText = summaryEvent.text

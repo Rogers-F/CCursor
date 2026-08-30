@@ -8,6 +8,7 @@ import { resolveProviderRuntime } from '../llm';
 import { hydrateHistoryEntries, repairHistoryEntries } from './historyManager';
 import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy';
 import { releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock';
+import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from './conversationRuntime';
 import { executePreCompactHook } from './hookRuntime';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
 import { logger } from '../../logger';
@@ -188,22 +189,22 @@ async function* handleSummarizeActionLocked(
         keepTail: compactionPlan.keepTail.length,
     }, '[SUMMARIZE] LLM summary starting');
 
-    // 三级兜底 (流式, 与 inline 路径同一实现 — 两路行为一致)
-    let lastHeartbeatTime = Date.now();
-    for await (const summaryEvent of streamSummaryWithFallback({
+    // 三级兜底 (流式, 与 inline 路径同一实现 — 两路行为一致)。
+    // 心跳定时驱动 (与 inline 路径同修): 思考模型零事件期若心跳饿死,
+    // 客户端 ~93s stall 判死会弃 run 作废在飞行摘要。
+    for await (const summaryEvent of pumpWithTimedHeartbeats(streamSummaryWithFallback({
         provider: route.provider,
         model: route.model,
         sourceText: summarySourceText,
         contextTokenLimit,
-    })) {
+    }))) {
+        if (summaryEvent === HEARTBEAT_TICK) {
+            yield heartbeat();
+            continue;
+        }
         if (summaryEvent.type === 'delta') {
             summaryText += summaryEvent.text;
             yield summary(summaryEvent.text);
-        }
-        // LLM 生成期间持续 yield heartbeat, 防止客户端 stall detector 误判
-        if (Date.now() - lastHeartbeatTime >= 4000) {
-            yield heartbeat();
-            lastHeartbeatTime = Date.now();
         }
         if (summaryEvent.type === 'done')
             summaryText = summaryEvent.text;

@@ -29,6 +29,7 @@ import {
   planCompaction,
 } from '../handlers/agent/compactionStrategy'
 import { CONTEXT_LENGTH_RETRY_MAX } from '../handlers/agent/constants'
+import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from '../handlers/agent/conversationRuntime'
 import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
 import { countTokens } from '../handlers/agent/tokenCounter'
 import {
@@ -1130,6 +1131,27 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
 
     expect(capturedRequestKeys).toHaveLength(1)
     expect(capturedRequestKeys[0]!.sort()).toEqual(['messages', 'model'])
+  })
+
+  it('#37 定时心跳泵: 源流静默期持续产出 HEARTBEAT_TICK, 事件序保持 (二次实弹修正)', async () => {
+    async function* slowSourceStream(): AsyncGenerator<{ type: string, text: string }> {
+      yield { type: 'text_delta', text: 'first' }
+      // 模拟思考模型黑箱期: 120ms 零事件 (泵间隔 25ms → 期间应产出多个 tick)
+      await new Promise(resolvePause => setTimeout(resolvePause, 120))
+      yield { type: 'text_delta', text: 'second' }
+    }
+
+    const observedSequence: Array<string> = []
+    for await (const pumpedEvent of pumpWithTimedHeartbeats(slowSourceStream(), 25)) {
+      observedSequence.push(pumpedEvent === HEARTBEAT_TICK ? 'tick' : pumpedEvent.text)
+    }
+
+    // 事件完整且有序; 静默期至少 2 个 tick (120ms / 25ms 理论 4 个, 留调度余量)
+    expect(observedSequence[0]).toBe('first')
+    expect(observedSequence[observedSequence.length - 1]).toBe('second')
+    const tickCount = observedSequence.filter(entry => entry === 'tick').length
+    expect(tickCount).toBeGreaterThanOrEqual(2)
+    expect(observedSequence.filter(entry => entry !== 'tick')).toEqual(['first', 'second'])
   })
 
   it('#17 水位分配器: 200 条不等长消息 — min-quota 丢弃占位, <user_query> 块存续', () => {

@@ -11,7 +11,7 @@ import { decodeBlob } from './blob'
 import { cacheBlob, getCachedBlob } from './blobStore'
 import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
-import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy'
+import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, resolveSummaryThinkingLevel, streamSummaryWithFallback } from './compactionStrategy'
 import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock'
 import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
@@ -647,6 +647,7 @@ async function* performInlineAutoSummarizeLocked(params: {
     model: route.model,
     sourceText: summarySourceText,
     contextTokenLimit,
+    thinkingLevel: resolveSummaryThinkingLevel(route),
   })) {
     if (summaryEvent.type === 'delta') {
       summaryText += summaryEvent.text

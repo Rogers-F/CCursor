@@ -6,7 +6,7 @@ import { heartbeat, checkpoint, kvMessage, summary, summaryCompleted, summarySta
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
 import { hydrateHistoryEntries, repairHistoryEntries } from './historyManager';
-import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy';
+import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, resolveSummaryThinkingLevel, streamSummaryWithFallback } from './compactionStrategy';
 import { releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock';
 import { executePreCompactHook } from './hookRuntime';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
@@ -195,6 +195,7 @@ async function* handleSummarizeActionLocked(
         model: route.model,
         sourceText: summarySourceText,
         contextTokenLimit,
+        thinkingLevel: resolveSummaryThinkingLevel(route),
     })) {
         if (summaryEvent.type === 'delta') {
             summaryText += summaryEvent.text;

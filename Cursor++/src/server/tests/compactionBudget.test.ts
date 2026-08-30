@@ -28,6 +28,7 @@ import {
   generateSummaryWithFallback,
   measureMessagesTokens,
   planCompaction,
+  resolveSummaryThinkingLevel,
 } from '../handlers/agent/compactionStrategy'
 import { CONTEXT_LENGTH_RETRY_MAX } from '../handlers/agent/constants'
 import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
@@ -1132,6 +1133,32 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
     expect(capturedRequests[0]!.maxTokens).toBe(9_600)
     // 巨窗上界封顶 16384: 1M 窗 hardCap = 2×5000 = 10000 → 2×10000 = 20000 → clamp 16384
     expect(computeSummaryMaxOutputTokens(1_000_000)).toBe(16_384)
+  })
+
+  it('#37 摘要推理档位: 仅 openai-responses × thinking 模型传 low, 其余不传 (F6)', async () => {
+    // 决策矩阵
+    expect(resolveSummaryThinkingLevel({ provider: { name: 'openai-responses' }, thinking: true })).toBe('low')
+    expect(resolveSummaryThinkingLevel({ provider: { name: 'openai-responses' }, thinking: false })).toBeUndefined()
+    expect(resolveSummaryThinkingLevel({ provider: { name: 'anthropic' }, thinking: true })).toBeUndefined()
+    expect(resolveSummaryThinkingLevel({ provider: { name: 'openai-chat' }, thinking: true })).toBeUndefined()
+    expect(resolveSummaryThinkingLevel({ provider: { name: 'gemini' }, thinking: true })).toBeUndefined()
+
+    // 端到端透传: thinkingLevel 出现在 provider.stream 请求上
+    const capturedRequests: Array<{ thinkingLevel?: string }> = []
+    const recordingProvider = {
+      async* stream(request: { model: string, thinkingLevel?: string }) {
+        capturedRequests.push({ thinkingLevel: request.thinkingLevel })
+        yield { type: 'text_delta', text: '- summary line' }
+      },
+    }
+    await generateSummaryWithFallback({
+      provider: recordingProvider,
+      model: 'test-model',
+      sourceText: makeVariedTokenText(300),
+      contextTokenLimit: 120_000,
+      thinkingLevel: 'low',
+    })
+    expect(capturedRequests[0]!.thinkingLevel).toBe('low')
   })
 
   it('#17 水位分配器: 200 条不等长消息 — min-quota 丢弃占位, <user_query> 块存续', () => {

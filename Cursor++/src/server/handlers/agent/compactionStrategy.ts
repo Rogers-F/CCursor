@@ -36,6 +36,7 @@ import {
     SUMMARY_SOURCE_MAX_CHARS,
     SUMMARY_SOURCE_MIN_QUOTA_CHARS,
     SUMMARY_SOURCE_WINDOW_RATIO,
+    SUMMARY_THINKING_LEVEL,
     TARGET_FLOOR_RATIO,
 } from './constants';
 import { countTokens as countTokensWithO200k, sliceTextHeadTailTokens, takeTextByTokens } from './tokenCounter';
@@ -1125,10 +1126,16 @@ export interface SummaryStreamTimeouts {
 }
 
 export interface SummaryGenerationParams {
-    provider: { stream: (request: { model: string, messages: LLMMessage[], maxTokens?: number }) => AsyncIterable<{ type: string, text?: string }> };
+    provider: { stream: (request: { model: string, messages: LLMMessage[], maxTokens?: number, thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' }) => AsyncIterable<{ type: string, text?: string }> };
     model: string;
     sourceText: string;
     contextTokenLimit: number;
+    /**
+     * F6: 推理模型的摘要专用档位 (调用点按 route.thinking + provider 类型决定)。
+     * openai-responses 上还会连带 summary:'auto' — 推理期产出 thinking_delta
+     * 作为 F3 停顿计时器的心跳, 消除"黑箱推理被误判挂死"的假阳性。
+     */
+    thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
     /** 测试注入: 覆盖全部尝试的限时参数 (生产用 constants 缺省) */
     timeoutsOverride?: SummaryStreamTimeouts;
 }
@@ -1148,6 +1155,18 @@ export function computeSummaryMaxOutputTokens(contextTokenLimit: number): number
         SUMMARY_MAX_OUTPUT_TOKENS_MAX,
         Math.max(SUMMARY_MAX_OUTPUT_TOKENS_MIN, computeSummaryHardCapTokens(contextTokenLimit) * 2),
     );
+}
+
+/**
+ * F6: 摘要请求的推理档位决策 (两路 runtime 共享)。
+ * 仅 openai-responses × thinking 模型传 low — 该组合下不传 reasoning 参数时
+ * 模型按默认 effort 黑箱思考且 API 零事件推送, 与挂死网关不可区分 (实弹 4 分钟);
+ * 传 low 后首字快出, 且 summary:'auto' 连带产出 thinking_delta 作为停顿计时心跳。
+ * 其余 provider 不传: Claude 无 thinking 参数即不思考 (本体会话压缩成功实证),
+ * anthropic/gemini 传档位反而会开启无谓的扩展思考。
+ */
+export function resolveSummaryThinkingLevel(route: { provider: { name: string }, thinking: boolean }): typeof SUMMARY_THINKING_LEVEL | undefined {
+    return route.thinking && route.provider.name === 'openai-responses' ? SUMMARY_THINKING_LEVEL : undefined;
 }
 
 const SUMMARY_TIMEOUT_SENTINEL: unique symbol = Symbol('summary-attempt-timeout');
@@ -1176,6 +1195,7 @@ async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAt
             { role: 'user', content: userContent },
         ],
         maxTokens: computeSummaryMaxOutputTokens(params.contextTokenLimit),
+        ...(params.thinkingLevel ? { thinkingLevel: params.thinkingLevel } : {}),
     })[Symbol.asyncIterator]();
 
     const attemptStartTime = Date.now();

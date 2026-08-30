@@ -145,5 +145,16 @@ export const SUMMARY_MAX_OUTPUT_TOKENS_MAX = 16_384;
 /** 错误驱动重试撞压缩锁时的最长等待 (等持锁压缩完成后自行重压) */
 export const CONTEXT_RETRY_LOCK_WAIT_MAX_MS = 90_000;
 
+/**
+ * 摘要请求的推理档位 (F6, 2026-08-29 实弹诊断):
+ * openai-responses 推理模型不带 reasoning 参数时按模型默认 effort 闷头思考,
+ * 且黑箱期 API 不推送任何可映射事件 (reasoning summary 需 summary:'auto' 才有)
+ * — 消费端与挂死网关不可区分, 实弹观测 4 分钟零事件。
+ * 显式压到 low: 首字快出 + summary:'auto' 提供推理期心跳; 摘要任务不需要深推理。
+ * 仅对 route.thinking===true 且 provider 为 openai-responses 的组合传递
+ * (Claude 不带 thinking 参数即不思考, 已被本体会话压缩成功实证)。
+ */
+export const SUMMARY_THINKING_LEVEL = 'low' as const;
+
 /** 入口截断 (阶段 1): ENTRY_CAP = min(25K tok, 25% × 窗口) */
 export const TASK_ENTRY_CAP_RATIO = 0.25;

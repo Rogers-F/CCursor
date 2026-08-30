@@ -125,10 +125,17 @@ export const CONTEXT_LENGTH_RETRY_MAX = 3;
  * 每次尝试三重限时: 首事件 / 事件间停顿 / 总时长; 超时抛错驱动兜底梯子
  * (递减源重试 → 确定性降级), 保证压缩在有界时间内必然完成。
  * 死等静默网关的最坏路径: 30s + 20s + 20s ≈ 70s 到确定性降级。
+ *
+ * 对照 (2026-08-29 三方调研): Codex 全流统一 idle-only 300s (无总时长上限,
+ * DEFAULT_STREAM_IDLE_TIMEOUT_MS) — 宽松是因为主回合也要容纳推理黑箱期;
+ * Cursor 官方摘要请求客户端侧未见任何超时 (托管通道 + 服务端专用摘要模型池)。
+ * 我们停顿限时敢收紧到 20s 的前提是 F6 已把推理期变为可见流 (thinking_delta
+ * 心跳); 总时长取 180s 而非两家的"无上限": 锁持有时长必须有界 (F5 依赖),
+ * 但要容纳健康慢流 — 180s × ~20 tok/s ≈ 3600 tok ≥ 典型摘要长度。
  */
 export const SUMMARY_ATTEMPT_FIRST_EVENT_TIMEOUT_MS = 30_000;
 export const SUMMARY_ATTEMPT_STALL_TIMEOUT_MS = 20_000;
-export const SUMMARY_ATTEMPT_TOTAL_TIMEOUT_MS = 120_000;
+export const SUMMARY_ATTEMPT_TOTAL_TIMEOUT_MS = 180_000;
 export const SUMMARY_RETRY_FIRST_EVENT_TIMEOUT_MS = 20_000;
 export const SUMMARY_RETRY_TOTAL_TIMEOUT_MS = 60_000;
 

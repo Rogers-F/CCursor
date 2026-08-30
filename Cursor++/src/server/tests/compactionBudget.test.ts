@@ -20,7 +20,6 @@ import {
   buildSummarySource,
 
   computeSummaryHardCapTokens,
-  computeSummaryMaxOutputTokens,
   computeSummarySourceBudgetChars,
   createCompactionArtifacts,
   estimateMessagesTokens,
@@ -28,7 +27,6 @@ import {
   generateSummaryWithFallback,
   measureMessagesTokens,
   planCompaction,
-  resolveSummaryThinkingLevel,
 } from '../handlers/agent/compactionStrategy'
 import { CONTEXT_LENGTH_RETRY_MAX } from '../handlers/agent/constants'
 import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
@@ -1086,7 +1084,7 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
     expect(summaryText.length).toBeGreaterThan(2_000)
   })
 
-  it('#35 挂死网关: 流永不产出事件 → 限时超时驱动兜底梯子, 有界时间内出确定性降级 (F3)', async () => {
+  it('#35 挂死网关: idle 超时驱动兜底梯子, 有界时间内出确定性降级 (Codex idle-only 形态)', async () => {
     const hangingProvider = {
       stream: () => ({
         [Symbol.asyncIterator]: () => ({
@@ -1102,21 +1100,24 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
       model: 'test-model',
       sourceText,
       contextTokenLimit: 120_000,
-      timeoutsOverride: { firstEventMs: 60, stallMs: 60, totalMs: 200 },
+      idleTimeoutMsOverride: 60,
     })
     const ladderElapsedMs = Date.now() - ladderStartTime
 
-    // 三次限时尝试 (≤200ms each) + 确定性降级 — 全程远低于旧实现的无限期挂死
+    // 三次 idle 限时尝试 (60ms each) + 确定性降级 — 全程远低于旧实现的无限期挂死
     expect(ladderElapsedMs).toBeLessThan(5_000)
     expect(summaryText).toContain('not instructions from the user')
     expect(summaryText).toContain('hanging-gateway-test')
   })
 
-  it('#36 摘要请求显式输出上限: maxTokens = clamp(2×hardCap, 4096, 16384) (F4)', async () => {
-    const capturedRequests: Array<{ maxTokens?: number }> = []
+  it('#36 摘要请求形态与两家上游一致: 仅 {model, messages}, 无 maxTokens / 无 reasoning 参数', async () => {
+    // 上游对齐 (2026-08-29 调研): 官方 Ki 生产调用与 Codex compact 请求均不传
+    // 输出上限与 reasoning 参数 — 输出长度靠 shorter-output prompt 指令 + hard-cap
+    // 裁剪控制, 推理行为交模型默认 (黑箱思考期由宽松 idle 超时容纳)
+    const capturedRequestKeys: string[][] = []
     const recordingProvider = {
-      async* stream(request: { model: string, maxTokens?: number }) {
-        capturedRequests.push({ maxTokens: request.maxTokens })
+      async* stream(request: Record<string, unknown>) {
+        capturedRequestKeys.push(Object.keys(request))
         yield { type: 'text_delta', text: '- summary line' }
       },
     }
@@ -1127,38 +1128,8 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
       contextTokenLimit: 120_000,
     })
 
-    // 120K 窗: hardCap = 2×min(5000, 2%×120000=2400) = 4800 → maxTokens = 9600
-    expect(capturedRequests).toHaveLength(1)
-    expect(capturedRequests[0]!.maxTokens).toBe(computeSummaryMaxOutputTokens(120_000))
-    expect(capturedRequests[0]!.maxTokens).toBe(9_600)
-    // 巨窗上界封顶 16384: 1M 窗 hardCap = 2×5000 = 10000 → 2×10000 = 20000 → clamp 16384
-    expect(computeSummaryMaxOutputTokens(1_000_000)).toBe(16_384)
-  })
-
-  it('#37 摘要推理档位: 仅 openai-responses × thinking 模型传 low, 其余不传 (F6)', async () => {
-    // 决策矩阵
-    expect(resolveSummaryThinkingLevel({ provider: { name: 'openai-responses' }, thinking: true })).toBe('low')
-    expect(resolveSummaryThinkingLevel({ provider: { name: 'openai-responses' }, thinking: false })).toBeUndefined()
-    expect(resolveSummaryThinkingLevel({ provider: { name: 'anthropic' }, thinking: true })).toBeUndefined()
-    expect(resolveSummaryThinkingLevel({ provider: { name: 'openai-chat' }, thinking: true })).toBeUndefined()
-    expect(resolveSummaryThinkingLevel({ provider: { name: 'gemini' }, thinking: true })).toBeUndefined()
-
-    // 端到端透传: thinkingLevel 出现在 provider.stream 请求上
-    const capturedRequests: Array<{ thinkingLevel?: string }> = []
-    const recordingProvider = {
-      async* stream(request: { model: string, thinkingLevel?: string }) {
-        capturedRequests.push({ thinkingLevel: request.thinkingLevel })
-        yield { type: 'text_delta', text: '- summary line' }
-      },
-    }
-    await generateSummaryWithFallback({
-      provider: recordingProvider,
-      model: 'test-model',
-      sourceText: makeVariedTokenText(300),
-      contextTokenLimit: 120_000,
-      thinkingLevel: 'low',
-    })
-    expect(capturedRequests[0]!.thinkingLevel).toBe('low')
+    expect(capturedRequestKeys).toHaveLength(1)
+    expect(capturedRequestKeys[0]!.sort()).toEqual(['messages', 'model'])
   })
 
   it('#17 水位分配器: 200 条不等长消息 — min-quota 丢弃占位, <user_query> 块存续', () => {

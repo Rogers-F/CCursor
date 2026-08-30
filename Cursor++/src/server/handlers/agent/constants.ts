@@ -118,50 +118,20 @@ export const SUMMARY_FALLBACK_MAX_CHARS = 3_200_000;
 export const CONTEXT_LENGTH_RETRY_MAX = 3;
 
 /**
- * 摘要执行可靠性 (2026-08-29 实弹验证修正 F3/F4):
- * 慢/挂死网关下摘要调用曾无限期占锁 (~4 分钟无产出), 期间并发 run 反复
- * 撞锁跳过并误增熔断计数, 上下文静默膨胀 (120K 窗实测冲到 158K)。
+ * 摘要流 idle 超时 = 300s, 逐字对齐 Codex DEFAULT_STREAM_IDLE_TIMEOUT_MS
+ * (codex-rs/model-provider-info, 2026-08-29 三方调研)。
  *
- * 每次尝试三重限时: 首事件 / 事件间停顿 / 总时长; 超时抛错驱动兜底梯子
- * (递减源重试 → 确定性降级), 保证压缩在有界时间内必然完成。
- * 死等静默网关的最坏路径: 30s + 20s + 20s ≈ 70s 到确定性降级。
- *
- * 对照 (2026-08-29 三方调研): Codex 全流统一 idle-only 300s (无总时长上限,
- * DEFAULT_STREAM_IDLE_TIMEOUT_MS) — 宽松是因为主回合也要容纳推理黑箱期;
- * Cursor 官方摘要请求客户端侧未见任何超时 (托管通道 + 服务端专用摘要模型池)。
- * 我们停顿限时敢收紧到 20s 的前提是 F6 已把推理期变为可见流 (thinking_delta
- * 心跳); 总时长取 180s 而非两家的"无上限": 锁持有时长必须有界 (F5 依赖),
- * 但要容纳健康慢流 — 180s × ~20 tok/s ≈ 3600 tok ≥ 典型摘要长度。
+ * 上游对齐决策 (官方可学学官方, 不可学学 Codex, 非必要不自创):
+ * - 超时形态: 官方客户端侧无摘要超时 (托管通道兜底) — BYOK 无托管通道不可学;
+ *   学 Codex: 单一 idle-only 计时 (事件间无活动 300s 判死), 无首字特判、
+ *   无总时长上限。宽松 300s 是为容纳推理模型黑箱思考期 (与两家一致,
+ *   摘要请求不传 reasoning 参数, 思考期零事件属正常形态)。
+ * - 有界性: 挂死网关最坏路径 = 3 次尝试 × 300s idle → 确定性降级;
+ *   真实挂死通常 TCP 层快速报错, 300s 静默是理论上界而非常态。
+ * - 实弹事故 (4 分钟黑箱思考被误判挂死) 在此形态下自然消解:
+ *   思考 4 分钟 < 300s idle, 思考完成后正常出流。
  */
-export const SUMMARY_ATTEMPT_FIRST_EVENT_TIMEOUT_MS = 30_000;
-export const SUMMARY_ATTEMPT_STALL_TIMEOUT_MS = 20_000;
-export const SUMMARY_ATTEMPT_TOTAL_TIMEOUT_MS = 180_000;
-export const SUMMARY_RETRY_FIRST_EVENT_TIMEOUT_MS = 20_000;
-export const SUMMARY_RETRY_TOTAL_TIMEOUT_MS = 60_000;
-
-/**
- * 摘要请求输出上限 = clamp(2 × SUMMARY_HARD_CAP, 4096, 16384)。
- * 不传时请求继承 provider 默认 (曾观测挂到主模型的 128K 配置), 推理型模型
- * 会把预算烧在 reasoning 上拖慢生成; 显式封顶让生成时长有界。
- * 上界 2×hardCap 而非 hardCap: reasoning token 计入 max_output_tokens 的
- * provider (openai-responses) 需要余量, 超出部分由 hard-cap 裁剪兜底。
- */
-export const SUMMARY_MAX_OUTPUT_TOKENS_MIN = 4_096;
-export const SUMMARY_MAX_OUTPUT_TOKENS_MAX = 16_384;
-
-/** 错误驱动重试撞压缩锁时的最长等待 (等持锁压缩完成后自行重压) */
-export const CONTEXT_RETRY_LOCK_WAIT_MAX_MS = 90_000;
-
-/**
- * 摘要请求的推理档位 (F6, 2026-08-29 实弹诊断):
- * openai-responses 推理模型不带 reasoning 参数时按模型默认 effort 闷头思考,
- * 且黑箱期 API 不推送任何可映射事件 (reasoning summary 需 summary:'auto' 才有)
- * — 消费端与挂死网关不可区分, 实弹观测 4 分钟零事件。
- * 显式压到 low: 首字快出 + summary:'auto' 提供推理期心跳; 摘要任务不需要深推理。
- * 仅对 route.thinking===true 且 provider 为 openai-responses 的组合传递
- * (Claude 不带 thinking 参数即不思考, 已被本体会话压缩成功实证)。
- */
-export const SUMMARY_THINKING_LEVEL = 'low' as const;
+export const SUMMARY_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 /** 入口截断 (阶段 1): ENTRY_CAP = min(25K tok, 25% × 窗口) */
 export const TASK_ENTRY_CAP_RATIO = 0.25;

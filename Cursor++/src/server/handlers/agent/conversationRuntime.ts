@@ -11,7 +11,7 @@ import { decodeBlob } from './blob'
 import { cacheBlob, getCachedBlob } from './blobStore'
 import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
-import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, resolveSummaryThinkingLevel, streamSummaryWithFallback } from './compactionStrategy'
+import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy'
 import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock'
 import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
@@ -23,7 +23,7 @@ import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline }
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
 import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
-import { CONTEXT_LENGTH_RETRY_MAX, CONTEXT_RETRY_LOCK_WAIT_MAX_MS } from './constants'
+import { CONTEXT_LENGTH_RETRY_MAX } from './constants'
 import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
@@ -647,7 +647,6 @@ async function* performInlineAutoSummarizeLocked(params: {
     model: route.model,
     sourceText: summarySourceText,
     contextTokenLimit,
-    thinkingLevel: resolveSummaryThinkingLevel(route),
   })) {
     if (summaryEvent.type === 'delta') {
       summaryText += summaryEvent.text
@@ -1355,34 +1354,32 @@ export async function* handleConversationRun(
           budgetOverride: aggressiveBudget,
         })
         if (retryCompactionResult === 'lock-held') {
-          // F5: 上下文已经爆窗, 唯一出路是压缩 — 等持锁压缩完成 (有界: F3 保证
-          // 摘要必然限时结束), 心跳保 SSE 活性, 释放后用本 run 视图重压一次
+          // 上下文已爆窗, 唯一出路是压缩 — 学官方 WaitForCompletion 形态纯等
+          // 持锁压缩完成 (无 deadline; 持锁者有界性由 idle 超时 + 兜底梯子保证),
+          // 心跳保 SSE 活性, 释放后用本 run 视图重压一次
           logger.warn({
             conversationId: parsed.conversationId,
             round,
             retry: contextLengthRetryCount,
           }, '[AUTOCOMPACT] context-length retry blocked by in-flight compaction — waiting for lock release')
-          const lockWaitDeadline = Date.now() + CONTEXT_RETRY_LOCK_WAIT_MAX_MS
-          while (isCompactionLockHeld(parsed.conversationId) && Date.now() < lockWaitDeadline) {
+          while (isCompactionLockHeld(parsed.conversationId)) {
             await Promise.race([
               waitForCompactionLockRelease(parsed.conversationId),
               new Promise(resolveSleep => setTimeout(resolveSleep, 4_000)),
             ])
             yield heartbeat()
           }
-          const secondAttempt = isCompactionLockHeld(parsed.conversationId)
-            ? null
-            : yield* performInlineAutoSummarize({
-                parsed,
-                allBlobIds: [...parsed.historyBlobIds, ...blobIds],
-                summaryArchiveIds: currentSummaryArchiveIds,
-                usedTokensEstimate,
-                contextTokenLimit,
-                messages,
-                route,
-                readPaths: [...readContext.readPaths],
-                budgetOverride: aggressiveBudget,
-              })
+          const secondAttempt = yield* performInlineAutoSummarize({
+            parsed,
+            allBlobIds: [...parsed.historyBlobIds, ...blobIds],
+            summaryArchiveIds: currentSummaryArchiveIds,
+            usedTokensEstimate,
+            contextTokenLimit,
+            messages,
+            route,
+            readPaths: [...readContext.readPaths],
+            budgetOverride: aggressiveBudget,
+          })
           retryCompactionResult = secondAttempt === 'lock-held' ? null : secondAttempt
         }
         // 至此 'lock-held' 已被上方分支消解 (TS 控制流可证), 仅剩成功对象或 null

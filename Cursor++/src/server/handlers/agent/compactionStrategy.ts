@@ -17,26 +17,19 @@ import {
     LARGE_ENTRY_MIN_TOKENS,
     PLACEHOLDER_PREVIEW_HEAD_TOKENS,
     PLACEHOLDER_PREVIEW_TAIL_TOKENS,
-    SUMMARY_ATTEMPT_FIRST_EVENT_TIMEOUT_MS,
-    SUMMARY_ATTEMPT_STALL_TIMEOUT_MS,
-    SUMMARY_ATTEMPT_TOTAL_TIMEOUT_MS,
     SUMMARY_FALLBACK_MAX_CHARS,
     SUMMARY_FALLBACK_MIN_CHARS,
     SUMMARY_FALLBACK_WINDOW_RATIO,
     SUMMARY_HARD_CAP_RESERVE_MULTIPLE,
-    SUMMARY_MAX_OUTPUT_TOKENS_MAX,
-    SUMMARY_MAX_OUTPUT_TOKENS_MIN,
     SUMMARY_RESERVE_MAX_TOKENS,
     SUMMARY_RESERVE_RATIO,
-    SUMMARY_RETRY_FIRST_EVENT_TIMEOUT_MS,
     SUMMARY_RETRY_MAX_ATTEMPTS,
     SUMMARY_RETRY_MAX_INPUT_RATIO,
     SUMMARY_RETRY_MIN_BUDGET_CHARS,
-    SUMMARY_RETRY_TOTAL_TIMEOUT_MS,
     SUMMARY_SOURCE_MAX_CHARS,
     SUMMARY_SOURCE_MIN_QUOTA_CHARS,
     SUMMARY_SOURCE_WINDOW_RATIO,
-    SUMMARY_THINKING_LEVEL,
+    SUMMARY_STREAM_IDLE_TIMEOUT_MS,
     TARGET_FLOOR_RATIO,
 } from './constants';
 import { countTokens as countTokensWithO200k, sliceTextHeadTailTokens, takeTextByTokens } from './tokenCounter';
@@ -1119,54 +1112,19 @@ export function computeSummaryHardCapTokens(contextTokenLimit: number): number {
 // 摘要生成三级兜底 (§4 generateSummaryWithFallback, 官方 CC-011 结构全量接线)
 // ═══════════════════════════════════════════════════════════════════
 
-export interface SummaryStreamTimeouts {
-    firstEventMs: number;
-    stallMs: number;
-    totalMs: number;
-}
-
 export interface SummaryGenerationParams {
-    provider: { stream: (request: { model: string, messages: LLMMessage[], maxTokens?: number, thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' }) => AsyncIterable<{ type: string, text?: string }> };
+    provider: { stream: (request: { model: string, messages: LLMMessage[] }) => AsyncIterable<{ type: string, text?: string }> };
     model: string;
     sourceText: string;
     contextTokenLimit: number;
-    /**
-     * F6: 推理模型的摘要专用档位 (调用点按 route.thinking + provider 类型决定)。
-     * openai-responses 上还会连带 summary:'auto' — 推理期产出 thinking_delta
-     * 作为 F3 停顿计时器的心跳, 消除"黑箱推理被误判挂死"的假阳性。
-     */
-    thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-    /** 测试注入: 覆盖全部尝试的限时参数 (生产用 constants 缺省) */
-    timeoutsOverride?: SummaryStreamTimeouts;
+    /** 测试注入: 覆盖 idle 超时 (生产用 SUMMARY_STREAM_IDLE_TIMEOUT_MS) */
+    idleTimeoutMsOverride?: number;
 }
 
 /** 剥离控制字符 (attempt 3 前的源净化) */
 function stripControlCharacters(text: string): string {
     // eslint-disable-next-line no-control-regex
     return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
-}
-
-/**
- * 摘要请求输出上限 = clamp(2 × SUMMARY_HARD_CAP, 4096, 16384)。
- * F4 修正: 不显式传时继承 provider/模型默认 (曾观测 128K), 推理型模型生成时长失控。
- */
-export function computeSummaryMaxOutputTokens(contextTokenLimit: number): number {
-    return Math.min(
-        SUMMARY_MAX_OUTPUT_TOKENS_MAX,
-        Math.max(SUMMARY_MAX_OUTPUT_TOKENS_MIN, computeSummaryHardCapTokens(contextTokenLimit) * 2),
-    );
-}
-
-/**
- * F6: 摘要请求的推理档位决策 (两路 runtime 共享)。
- * 仅 openai-responses × thinking 模型传 low — 该组合下不传 reasoning 参数时
- * 模型按默认 effort 黑箱思考且 API 零事件推送, 与挂死网关不可区分 (实弹 4 分钟);
- * 传 low 后首字快出, 且 summary:'auto' 连带产出 thinking_delta 作为停顿计时心跳。
- * 其余 provider 不传: Claude 无 thinking 参数即不思考 (本体会话压缩成功实证),
- * anthropic/gemini 传档位反而会开启无谓的扩展思考。
- */
-export function resolveSummaryThinkingLevel(route: { provider: { name: string }, thinking: boolean }): typeof SUMMARY_THINKING_LEVEL | undefined {
-    return route.thinking && route.provider.name === 'openai-responses' ? SUMMARY_THINKING_LEVEL : undefined;
 }
 
 const SUMMARY_TIMEOUT_SENTINEL: unique symbol = Symbol('summary-attempt-timeout');
@@ -1180,11 +1138,13 @@ function createCancellableTimeout(timeoutMs: number): { promise: Promise<typeof 
 }
 
 /**
- * 单次 LLM 摘要尝试 — 三重限时 (F3 修正):
- * 首事件 / 事件间停顿 / 总时长任一超限即抛错, 由兜底梯子接管。
- * 实弹事故: 挂死网关下 for-await 无限期阻塞, 锁跟着占 ~4 分钟。
+ * 单次 LLM 摘要尝试 — idle-only 超时 (Codex DEFAULT_STREAM_IDLE_TIMEOUT_MS 形态):
+ * 事件间无活动超过 idleTimeoutMs 判流死抛错, 由兜底梯子接管; 无首字特判、
+ * 无总时长上限 (与 Codex/官方一致)。请求体仅 {model, messages} — 不传
+ * maxTokens / reasoning 参数, 输出长度与推理行为交给模型默认, 同两家生产形态;
+ * 推理模型黑箱思考期零事件属正常, 由宽松 idle 容纳。
  */
-async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAttempt: string, shorterOutputInstruction: boolean, onDelta: (text: string) => void, timeouts: SummaryStreamTimeouts): Promise<string> {
+async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAttempt: string, shorterOutputInstruction: boolean, onDelta: (text: string) => void, idleTimeoutMs: number): Promise<string> {
     const { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } = await import('./summaryPrompt');
     const userContent = buildSummaryUserMessage(sourceForAttempt)
         + (shorterOutputInstruction ? '\n\nWrite a shorter summary — keep it dense and under the essentials.' : '');
@@ -1194,21 +1154,12 @@ async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAt
             { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
             { role: 'user', content: userContent },
         ],
-        maxTokens: computeSummaryMaxOutputTokens(params.contextTokenLimit),
-        ...(params.thinkingLevel ? { thinkingLevel: params.thinkingLevel } : {}),
     })[Symbol.asyncIterator]();
 
-    const attemptStartTime = Date.now();
-    let receivedFirstEvent = false;
     let collected = '';
     try {
         while (true) {
-            const elapsedMs = Date.now() - attemptStartTime;
-            const remainingTotalMs = timeouts.totalMs - elapsedMs;
-            if (remainingTotalMs <= 0)
-                throw new Error(`summary attempt timeout (total ${timeouts.totalMs}ms)`);
-            const perEventLimitMs = Math.min(receivedFirstEvent ? timeouts.stallMs : timeouts.firstEventMs, remainingTotalMs);
-            const timer = createCancellableTimeout(perEventLimitMs);
+            const timer = createCancellableTimeout(idleTimeoutMs);
             let stepResult: IteratorResult<{ type: string, text?: string }> | typeof SUMMARY_TIMEOUT_SENTINEL;
             try {
                 stepResult = await Promise.race([eventIterator.next(), timer.promise]);
@@ -1216,13 +1167,10 @@ async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAt
             finally {
                 timer.cancel();
             }
-            if (stepResult === SUMMARY_TIMEOUT_SENTINEL) {
-                const timeoutPhase = receivedFirstEvent ? 'stall' : 'first-event';
-                throw new Error(`summary attempt timeout (${timeoutPhase} ${perEventLimitMs}ms, elapsed ${Date.now() - attemptStartTime}ms)`);
-            }
+            if (stepResult === SUMMARY_TIMEOUT_SENTINEL)
+                throw new Error(`summary stream idle timeout (${idleTimeoutMs}ms without activity)`);
             if (stepResult.done)
                 break;
-            receivedFirstEvent = true;
             const event = stepResult.value;
             if (event.type === 'text_delta' && event.text) {
                 collected += event.text;
@@ -1236,15 +1184,6 @@ async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAt
         void Promise.resolve().then(() => eventIterator.return?.()).catch(() => {});
     }
     return collected.trim();
-}
-
-/** 每级尝试的限时: attempt 1 宽限, attempt 2+/hard-cap 重试收紧 */
-function resolveAttemptTimeouts(attempt: number, override?: SummaryStreamTimeouts): SummaryStreamTimeouts {
-    if (override)
-        return override;
-    return attempt <= 1
-        ? { firstEventMs: SUMMARY_ATTEMPT_FIRST_EVENT_TIMEOUT_MS, stallMs: SUMMARY_ATTEMPT_STALL_TIMEOUT_MS, totalMs: SUMMARY_ATTEMPT_TOTAL_TIMEOUT_MS }
-        : { firstEventMs: SUMMARY_RETRY_FIRST_EVENT_TIMEOUT_MS, stallMs: SUMMARY_ATTEMPT_STALL_TIMEOUT_MS, totalMs: SUMMARY_RETRY_TOTAL_TIMEOUT_MS };
 }
 
 /**
@@ -1262,6 +1201,7 @@ function resolveAttemptTimeouts(attempt: number, override?: SummaryStreamTimeout
  */
 async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerator<{ type: 'delta', text: string } | { type: 'done', text: string }, void, void> {
     const originalLength = params.sourceText.length;
+    const idleTimeoutMs = params.idleTimeoutMsOverride ?? SUMMARY_STREAM_IDLE_TIMEOUT_MS;
     let summaryText = '';
 
     for (let attempt = 1; attempt <= SUMMARY_RETRY_MAX_ATTEMPTS; attempt++) {
@@ -1281,7 +1221,7 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
             const attemptDeltas: string[] = [];
             const attemptText = await streamSummaryAttempt(params, attemptSource, attempt > 1, (deltaText) => {
                 attemptDeltas.push(deltaText);
-            }, resolveAttemptTimeouts(attempt, params.timeoutsOverride));
+            }, idleTimeoutMs);
             if (attemptText) {
                 for (const deltaText of attemptDeltas)
                     yield { type: 'delta', text: deltaText };
@@ -1311,7 +1251,7 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
             const retryDeltas: string[] = [];
             const retryText = await streamSummaryAttempt(params, params.sourceText.slice(0, Math.max(SUMMARY_RETRY_MIN_BUDGET_CHARS, Math.floor(originalLength * SUMMARY_RETRY_MAX_INPUT_RATIO))), true, (deltaText) => {
                 retryDeltas.push(deltaText);
-            }, resolveAttemptTimeouts(2, params.timeoutsOverride));
+            }, idleTimeoutMs);
             if (retryText && countTokensWithO200k(retryText) <= hardCapTokens) {
                 for (const deltaText of retryDeltas)
                     yield { type: 'delta', text: deltaText };

@@ -20,6 +20,7 @@ import {
   buildSummarySource,
 
   computeSummaryHardCapTokens,
+  computeSummaryMaxOutputTokens,
   computeSummarySourceBudgetChars,
   createCompactionArtifacts,
   estimateMessagesTokens,
@@ -1082,6 +1083,55 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
     expect(summaryText).toContain(sourceText.slice(0, 100))
     // 降级预算 = clamp(258400×2%×4, 50K, 3.2M) = 50K chars — 全量保留
     expect(summaryText.length).toBeGreaterThan(2_000)
+  })
+
+  it('#35 挂死网关: 流永不产出事件 → 限时超时驱动兜底梯子, 有界时间内出确定性降级 (F3)', async () => {
+    const hangingProvider = {
+      stream: () => ({
+        [Symbol.asyncIterator]: () => ({
+          // next() 永不 resolve — 复刻实弹事故里挂死 ~4 分钟的网关
+          next: () => new Promise<IteratorResult<{ type: string, text?: string }>>(() => {}),
+        }),
+      }),
+    }
+    const sourceText = `hanging-gateway-test ${makeVariedTokenText(500)}`
+    const ladderStartTime = Date.now()
+    const summaryText = await generateSummaryWithFallback({
+      provider: hangingProvider,
+      model: 'test-model',
+      sourceText,
+      contextTokenLimit: 120_000,
+      timeoutsOverride: { firstEventMs: 60, stallMs: 60, totalMs: 200 },
+    })
+    const ladderElapsedMs = Date.now() - ladderStartTime
+
+    // 三次限时尝试 (≤200ms each) + 确定性降级 — 全程远低于旧实现的无限期挂死
+    expect(ladderElapsedMs).toBeLessThan(5_000)
+    expect(summaryText).toContain('not instructions from the user')
+    expect(summaryText).toContain('hanging-gateway-test')
+  })
+
+  it('#36 摘要请求显式输出上限: maxTokens = clamp(2×hardCap, 4096, 16384) (F4)', async () => {
+    const capturedRequests: Array<{ maxTokens?: number }> = []
+    const recordingProvider = {
+      async* stream(request: { model: string, maxTokens?: number }) {
+        capturedRequests.push({ maxTokens: request.maxTokens })
+        yield { type: 'text_delta', text: '- summary line' }
+      },
+    }
+    await generateSummaryWithFallback({
+      provider: recordingProvider,
+      model: 'test-model',
+      sourceText: makeVariedTokenText(300),
+      contextTokenLimit: 120_000,
+    })
+
+    // 120K 窗: hardCap = 2×min(5000, 2%×120000=2400) = 4800 → maxTokens = 9600
+    expect(capturedRequests).toHaveLength(1)
+    expect(capturedRequests[0]!.maxTokens).toBe(computeSummaryMaxOutputTokens(120_000))
+    expect(capturedRequests[0]!.maxTokens).toBe(9_600)
+    // 巨窗上界封顶 16384: 1M 窗 hardCap = 2×5000 = 10000 → 2×10000 = 20000 → clamp 16384
+    expect(computeSummaryMaxOutputTokens(1_000_000)).toBe(16_384)
   })
 
   it('#17 水位分配器: 200 条不等长消息 — min-quota 丢弃占位, <user_query> 块存续', () => {

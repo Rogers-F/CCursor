@@ -69,3 +69,8 @@ export function releaseCompactionLock(conversationId: string): void {
 export function getCompactionContentionCount(conversationId: string): number {
     return contentionCounts.get(conversationId) ?? 0;
 }
+
+/** 只读探测 (不计争用): 错误驱动重试路径的等待循环用 */
+export function isCompactionLockHeld(conversationId: string): boolean {
+    return compactionLocks.get(conversationId)?.held === true;
+}

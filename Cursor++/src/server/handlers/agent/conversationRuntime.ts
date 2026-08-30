@@ -12,7 +12,7 @@ import { cacheBlob, getCachedBlob } from './blobStore'
 import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
 import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy'
-import { getCompactionContentionCount, releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock'
+import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock'
 import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
@@ -23,7 +23,7 @@ import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline }
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
 import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
-import { CONTEXT_LENGTH_RETRY_MAX } from './constants'
+import { CONTEXT_LENGTH_RETRY_MAX, CONTEXT_RETRY_LOCK_WAIT_MAX_MS } from './constants'
 import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
@@ -528,16 +528,19 @@ async function* performInlineAutoSummarize(params: {
   newMessages: LLMMessage[]
   /** 本轮规划实际采用的基准预算 (错误驱动重试的 budget/2^retry 被除数) */
   baseBudgetTokens: number
-} | null> {
+} | 'lock-held' | null> {
   const { parsed } = params
 
-  // 并发互斥 (设计文档 §7#7): inline 触发时锁被占 → 本轮跳过并计数, 下轮重试
+  // 并发互斥 (设计文档 §7#7): inline 触发时锁被占 → 本轮跳过, 下轮重试。
+  // F5 修正 (2026-08-29 实弹): 返回 'lock-held' 哨兵而非 null —
+  // 锁被占意味着另一路压缩正在进行, 不是压缩失败, 不得计入熔断计数
+  // (实弹曾观测: 慢摘要占锁 → 并发 run 三连撞锁 → 熔断误开 → 压缩被永久关停)。
   if (!tryAcquireCompactionLock(parsed.conversationId)) {
     logger.warn({
       conversationId: parsed.conversationId,
       contentionCount: getCompactionContentionCount(parsed.conversationId),
-    }, '[AUTOCOMPACT] compaction lock held (manual summarize in progress?) — skipping inline compaction this round')
-    return null
+    }, '[AUTOCOMPACT] compaction lock held (another compaction in flight) — skipping this round without counting failure')
+    return 'lock-held'
   }
   try {
     return yield* performInlineAutoSummarizeLocked(params)
@@ -1339,7 +1342,7 @@ export async function* handleConversationRun(
           aggressiveBudget,
           error: (e as Error).message,
         }, '[AUTOCOMPACT] context-length error — retrying with aggressive compaction')
-        const retryCompactionResult = yield* performInlineAutoSummarize({
+        let retryCompactionResult = yield* performInlineAutoSummarize({
           parsed,
           allBlobIds: [...parsed.historyBlobIds, ...blobIds],
           summaryArchiveIds: currentSummaryArchiveIds,
@@ -1350,7 +1353,39 @@ export async function* handleConversationRun(
           readPaths: [...readContext.readPaths],
           budgetOverride: aggressiveBudget,
         })
-        if (retryCompactionResult) {
+        if (retryCompactionResult === 'lock-held') {
+          // F5: 上下文已经爆窗, 唯一出路是压缩 — 等持锁压缩完成 (有界: F3 保证
+          // 摘要必然限时结束), 心跳保 SSE 活性, 释放后用本 run 视图重压一次
+          logger.warn({
+            conversationId: parsed.conversationId,
+            round,
+            retry: contextLengthRetryCount,
+          }, '[AUTOCOMPACT] context-length retry blocked by in-flight compaction — waiting for lock release')
+          const lockWaitDeadline = Date.now() + CONTEXT_RETRY_LOCK_WAIT_MAX_MS
+          while (isCompactionLockHeld(parsed.conversationId) && Date.now() < lockWaitDeadline) {
+            await Promise.race([
+              waitForCompactionLockRelease(parsed.conversationId),
+              new Promise(resolveSleep => setTimeout(resolveSleep, 4_000)),
+            ])
+            yield heartbeat()
+          }
+          const secondAttempt = isCompactionLockHeld(parsed.conversationId)
+            ? null
+            : yield* performInlineAutoSummarize({
+                parsed,
+                allBlobIds: [...parsed.historyBlobIds, ...blobIds],
+                summaryArchiveIds: currentSummaryArchiveIds,
+                usedTokensEstimate,
+                contextTokenLimit,
+                messages,
+                route,
+                readPaths: [...readContext.readPaths],
+                budgetOverride: aggressiveBudget,
+              })
+          retryCompactionResult = secondAttempt === 'lock-held' ? null : secondAttempt
+        }
+        // 至此 'lock-held' 已被上方分支消解 (TS 控制流可证), 仅剩成功对象或 null
+        if (retryCompactionResult !== null) {
           messages = retryCompactionResult.newMessages
           parsed.historyBlobIds = retryCompactionResult.newBlobIds
           currentSummaryArchiveIds = retryCompactionResult.newSummaryArchiveIds
@@ -1607,7 +1642,14 @@ export async function* handleConversationRun(
           readPaths: [...readContext.readPaths],
         })
 
-        if (compactionResult) {
+        if (compactionResult === 'lock-held') {
+          // F5: 另一路压缩在飞行中 — 跳过本轮但不计失败 (熔断只留给真实压缩失败)
+          logger.info({
+            conversationId: parsed.conversationId,
+            round,
+            contentionCount: getCompactionContentionCount(parsed.conversationId),
+          }, '[AGENT] auto-summarize: concurrent compaction in flight — round skipped, failure fuse untouched')
+        } else if (compactionResult) {
           // 用 compacted 后的状态替换当前状态，继续后续 round
           messages = compactionResult.newMessages
           parsed.historyBlobIds = compactionResult.newBlobIds

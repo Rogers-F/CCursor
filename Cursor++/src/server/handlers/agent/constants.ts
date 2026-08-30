@@ -117,5 +117,33 @@ export const SUMMARY_FALLBACK_MAX_CHARS = 3_200_000;
 /** 错误驱动压缩重试上限 (官方 5 轮, BYOK 单轮成本更高取保守值) */
 export const CONTEXT_LENGTH_RETRY_MAX = 3;
 
+/**
+ * 摘要执行可靠性 (2026-08-29 实弹验证修正 F3/F4):
+ * 慢/挂死网关下摘要调用曾无限期占锁 (~4 分钟无产出), 期间并发 run 反复
+ * 撞锁跳过并误增熔断计数, 上下文静默膨胀 (120K 窗实测冲到 158K)。
+ *
+ * 每次尝试三重限时: 首事件 / 事件间停顿 / 总时长; 超时抛错驱动兜底梯子
+ * (递减源重试 → 确定性降级), 保证压缩在有界时间内必然完成。
+ * 死等静默网关的最坏路径: 30s + 20s + 20s ≈ 70s 到确定性降级。
+ */
+export const SUMMARY_ATTEMPT_FIRST_EVENT_TIMEOUT_MS = 30_000;
+export const SUMMARY_ATTEMPT_STALL_TIMEOUT_MS = 20_000;
+export const SUMMARY_ATTEMPT_TOTAL_TIMEOUT_MS = 120_000;
+export const SUMMARY_RETRY_FIRST_EVENT_TIMEOUT_MS = 20_000;
+export const SUMMARY_RETRY_TOTAL_TIMEOUT_MS = 60_000;
+
+/**
+ * 摘要请求输出上限 = clamp(2 × SUMMARY_HARD_CAP, 4096, 16384)。
+ * 不传时请求继承 provider 默认 (曾观测挂到主模型的 128K 配置), 推理型模型
+ * 会把预算烧在 reasoning 上拖慢生成; 显式封顶让生成时长有界。
+ * 上界 2×hardCap 而非 hardCap: reasoning token 计入 max_output_tokens 的
+ * provider (openai-responses) 需要余量, 超出部分由 hard-cap 裁剪兜底。
+ */
+export const SUMMARY_MAX_OUTPUT_TOKENS_MIN = 4_096;
+export const SUMMARY_MAX_OUTPUT_TOKENS_MAX = 16_384;
+
+/** 错误驱动重试撞压缩锁时的最长等待 (等持锁压缩完成后自行重压) */
+export const CONTEXT_RETRY_LOCK_WAIT_MAX_MS = 90_000;
+
 /** 入口截断 (阶段 1): ENTRY_CAP = min(25K tok, 25% × 窗口) */
 export const TASK_ENTRY_CAP_RATIO = 0.25;
